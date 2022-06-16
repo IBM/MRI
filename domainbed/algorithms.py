@@ -320,7 +320,7 @@ class CDANN(AbstractDANN):
 
 
 
-class IRM(ERM):
+class IRM_domainbed(ERM):
     """Invariant Risk Minimization"""
 
     def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):

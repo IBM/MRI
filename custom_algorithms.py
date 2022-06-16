@@ -41,7 +41,7 @@ def get_weight_norm(params):
 #             if param.dtype == torch.cfloat:
 #                 param.imag -= param.imag
 
-def ICM_output_modification(logits, label, loss_type, num_classes):
+def output_modification(logits, label, loss_type, num_classes):
     if loss_type == 'binary_classification':
         label = label.view(logits.shape).to(logits.dtype) - 0.5
         prob = torch.sigmoid(logits) - 0.5
@@ -59,90 +59,90 @@ def ICM_output_modification(logits, label, loss_type, num_classes):
         # logits *= 2     
     return logits, label, prob
     
-class rev_IRM(ERM):
-    """Invariant Risk Minimization"""
+# class rev_IRM(ERM):
+#     """Invariant Risk Minimization"""
     
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super().__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
-        self.register_buffer('update_count', torch.tensor([0]))
-        self.grad_clip =  hparams['grad_clip']
+#     def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
+#         super().__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+#         self.register_buffer('update_count', torch.tensor([0]))
+#         self.grad_clip =  hparams['grad_clip']
 
-    def _irm_grad(self, logits, label):
-        # if self.dummy:
-        if self.hparams['loss_type'] == 'binary_classification':
-            label = label.view(logits.shape).to(logits.dtype) - 0.5
-        dummy = torch.tensor(1.).to(logits.device).requires_grad_()
-        params = [dummy]
-        label = label*dummy
-        # else:
-        #     params = self.network.classifier.parameters()
+#     def _irm_grad(self, logits, label):
+#         # if self.dummy:
+#         if self.hparams['loss_type'] == 'binary_classification':
+#             label = label.view(logits.shape).to(logits.dtype) - 0.5
+#         dummy = torch.tensor(1.).to(logits.device).requires_grad_()
+#         params = [dummy]
+#         label = label*dummy
+#         # else:
+#         #     params = self.network.classifier.parameters()
             
-        loss = self.loss_fn(logits, label)
-        grads = autograd.grad(loss, params, create_graph=True)
-        grads = torch.cat([g.view(-1) for g in grads])
-        return grads, loss    
+#         loss = self.loss_fn(logits, label)
+#         grads = autograd.grad(loss, params, create_graph=True)
+#         grads = torch.cat([g.view(-1) for g in grads])
+#         return grads, loss    
                 
-    def compute_loss(self, data_envs):
-        nll = 0.
-        penalty = 0.
-        grads = []
-        logits_all = []
+#     def compute_loss(self, data_envs):
+#         nll = 0.
+#         penalty = 0.
+#         grads = []
+#         logits_all = []
         
-        for i, (x, y) in enumerate(data_envs):
-            logits = self.network(x)
-            grad, loss = self._irm_grad(logits, y)
-            nll += loss
-            grads.append(grad)
-            logits_all.append(logits)
+#         for i, (x, y) in enumerate(data_envs):
+#             logits = self.network(x)
+#             grad, loss = self._irm_grad(logits, y)
+#             nll += loss
+#             grads.append(grad)
+#             logits_all.append(logits)
         
-        grads = torch.stack(grads) 
-        logits_var = torch.stack(logits_all).var(keepdim=True, dim=(1,2)).mean().detach()
+#         grads = torch.stack(grads) 
+#         logits_var = torch.stack(logits_all).var(keepdim=True, dim=(1,2)).mean().detach()
         
-        penalty = ((grads - grads.mean(keepdim=True, dim=0)).abs()**2).sum()
+#         penalty = ((grads - grads.mean(keepdim=True, dim=0)).abs()**2).sum()
         
-        return nll/len(data_envs), penalty/len(data_envs), logits_var 
+#         return nll/len(data_envs), penalty/len(data_envs), logits_var 
 
     
-    def compute_loss_with_penalty(self, loss, penalty, logits_amp):
-        penalty_weight = self.hparams['irm_lambda']  if self.update_count >= self.hparams['irm_penalty_anneal_iters'] else 1
+#     def compute_loss_with_penalty(self, loss, penalty, logits_amp):
+#         penalty_weight = self.hparams['irm_lambda']  if self.update_count >= self.hparams['irm_penalty_anneal_iters'] else 1
         
-        # if self.adaptive_penalty:
-        #     penalty_weight *= logits_amp
+#         # if self.adaptive_penalty:
+#         #     penalty_weight *= logits_amp
             
-        if self.hparams['irm_type'] in [None, 'additive']:
-            loss = loss + penalty_weight * penalty
-        elif self.hparams['irm_type'] == 'multiplicative':
-            loss = loss * (1 + penalty_weight * penalty)
-        elif self.hparams['irm_type'] == 'exponential':
-            loss = penalty_weight * penalty + torch.log(loss)
-            loss = torch.log( 1 + torch.exp(loss)) if loss < 15 else loss    
-        return loss 
+#         if self.hparams['irm_type'] in [None, 'additive']:
+#             loss = loss + penalty_weight * penalty
+#         elif self.hparams['irm_type'] == 'multiplicative':
+#             loss = loss * (1 + penalty_weight * penalty)
+#         elif self.hparams['irm_type'] == 'exponential':
+#             loss = penalty_weight * penalty + torch.log(loss)
+#             loss = torch.log( 1 + torch.exp(loss)) if loss < 15 else loss    
+#         return loss 
 
-    def update(self, data_envs, unlabeled=None):
+#     def update(self, data_envs, unlabeled=None):
 
-        nll, penalty, logits_var = self.compute_loss(data_envs)
-        loss = self.compute_loss_with_penalty(nll, penalty, logits_var)
+#         nll, penalty, logits_var = self.compute_loss(data_envs)
+#         loss = self.compute_loss_with_penalty(nll, penalty, logits_var)
 
-        if self.update_count == self.hparams['irm_penalty_anneal_iters']:
-            # Reset Adam, because it doesn't like the sharp jump in gradient magnitudes that happens at this step.
-            self.optimizer = get_optimizer(self.hparams, self.network.parameters())
+#         if self.update_count == self.hparams['irm_penalty_anneal_iters']:
+#             # Reset Adam, because it doesn't like the sharp jump in gradient magnitudes that happens at this step.
+#             self.optimizer = get_optimizer(self.hparams, self.network.parameters())
             
-        self.optimizer.zero_grad()
-        loss.backward()
+#         self.optimizer.zero_grad()
+#         loss.backward()
         
-        grad_norm = get_grad_norm(self.network.parameters())
-        clip_grad_norm_(self.network.parameters(), self.grad_clip)
-        self.optimizer.step()
-        # if self.hparams['set_imag_to_zero']:
-        #     set_imag_to_zero(self.network.parameters())
+#         grad_norm = get_grad_norm(self.network.parameters())
+#         clip_grad_norm_(self.network.parameters(), self.grad_clip)
+#         self.optimizer.step()
+#         # if self.hparams['set_imag_to_zero']:
+#         #     set_imag_to_zero(self.network.parameters())
         
-        w_norm = get_weight_norm(self.network.parameters())
-        self.update_count += 1
-        return {'loss': loss.item(), 'nll': nll.item(),  'penalty': penalty.sqrt().item(), 
-                'grad_norm': grad_norm.item(), 'weight_norm': w_norm.item(), 'logits_amp': logits_var.item(),}    
+#         w_norm = get_weight_norm(self.network.parameters())
+#         self.update_count += 1
+#         return {'loss': loss.item(), 'nll': nll.item(),  'penalty': penalty.sqrt().item(), 
+#                 'grad_norm': grad_norm.item(), 'weight_norm': w_norm.item(), 'logits_amp': logits_var.item(),}    
 
 
-class IRM_new(ERM):
+class IRM(ERM):
 
     const_type = 'IRM'
     
@@ -197,7 +197,7 @@ class IRM_new(ERM):
         return self.loss_fn(logits_, label_all_)
         
     def get_constraint(self, logits, label_all):
-        logits, label_all, prob = ICM_output_modification(logits, label_all, self.hparams['loss_type'], self.num_classes)     
+        logits, label_all, prob = output_modification(logits, label_all, self.hparams['loss_type'], self.num_classes)     
         oo = (logits.conj()*prob).mean(dim=1)
         oy = (logits.conj()*label_all).mean(dim=1)
                
@@ -264,13 +264,13 @@ class IRM_new(ERM):
                 'grad_norm': grad_norm.item(), 'weight_norm': w_norm.item(), 'logits_amp': logits_var.item(),}
 
 
-class ICM_oy(IRM_new):
+class MRI(IRM):
     const_type = 'oy'
 
-class ICM_oo(IRM_new):
-    const_type = 'oo'
+# class ICM_oo(IRM):
+#     const_type = 'oo'
 
-class ICM_oo_oy(IRM_new):
+class relaxed_IRM(IRM):
     const_type = 'oo-oy'
         
 
@@ -324,7 +324,7 @@ class IRM_ADMM(ERM):
         return self.loss_fn(logits_, label_all_)
     
     def get_constraint(self, logits, label_all):
-        logits, label_all, prob = ICM_output_modification(logits, label_all, self.hparams['loss_type'], self.num_classes)     
+        logits, label_all, prob = output_modification(logits, label_all, self.hparams['loss_type'], self.num_classes)     
         
         oo = (logits.conj()*prob).mean(dim=1)
         oy = (logits.conj()*label_all).mean(dim=1)
@@ -403,17 +403,17 @@ class IRM_ADMM(ERM):
         return scale
 
 
-class ICM_oy_ADMM(IRM_ADMM):
+class MRI_ADMM(IRM_ADMM):
     const_type = 'oy'
 
-class ICM_oo_ADMM(IRM_ADMM):
-    const_type = 'oo'
+# class ICM_oo_ADMM(IRM_ADMM):
+#     const_type = 'oo'
 
-class ICM_oo_oy_ADMM(IRM_ADMM):
+class relaxed_IRM_ADMM(IRM_ADMM):
     const_type = 'oo-oy'
 
-class rev_IRM_ADMM(IRM_ADMM):
-    const_type = 'yy-oy'
+# class rev_IRM_ADMM(IRM_ADMM):
+#     const_type = 'yy-oy'
     
 def get_ortho_diff(n_env):
     # import math
@@ -422,70 +422,3 @@ def get_ortho_diff(n_env):
     # U_mean = a[0:1]  # ones.T /math.sqrt(n_env)
     U_diff = a[1:]
     return U_diff        
-        
-
-
-##########################################################
-
-#     def loss_fn_augmented(self, logits, label_all): 
-#         params, lagrange_mult = self.network.parameters, self.network.lagrange_mult
-        
-#         if len(label_all.shape) == 2:
-#             label_all=label_all.unsqueeze(0)
-#         if len(logits.shape) == 2:
-#             logits=logits.unsqueeze(0)
-            
-#         n_env, batch, n_out = label_all.shape
-        
-#         assert n_out ==1
-
-#         factor_ = 1 - lagrange_mult.detach().T@ self.U_diff *n_env 
-#         label_corrected_ =  factor_.view(-1,1,1).to(label_all.device)*label_all
-#         L0_LM_detached = (logits - label_corrected_).abs().pow(2).mean()/2       # for  params update only   
-        
-#         oy = (logits.conj()*label_all).mean(dim=1)  
-#         oy_err = self.U_diff.to(oy.device, dtype=oy.dtype) @ oy
-#         L_oy = oy_err.abs().pow(2).mean()/2 /(1-1/n_env)   # for  params update only   
-#         return L0_LM_detached,  L_oy, #L_ #, oy
-    
-
-
-# class ICM_NG_Loss(nn.Module): 
-#     def __init__(self, coeff, train_loaders_iter, steps_per_epoch, device, task='regression', reduction='mean'):
-#         super().__init__()
-        
-#         if task=='regression':
-#             self.loss_fn = nn.MSELoss(reduction=reduction)
-#         elif task=='classification':
-#             self.loss_fn = nn.BCEWithLogitsLoss(reduction=reduction)
-        
-#         label_all = [] #torch.stack([y.view(-1) for _, y in data_envs])
-#         for _ in range(steps_per_epoch):
-#             data_envs = [(x.to(device), y.to(device)) for x, y in next(train_loaders_iter)]
-#             label_all.append(torch.stack([y.view(-1) for _, y in data_envs]))
-        
-#         label_all = torch.cat(label_all, dim=-1)
-#         yy = label_all.pow(2).mean(dim=1)
-#         q = (1/yy) / (1 + (1/yy)/coeff)  # coeff-> infty: 1/yy  
-#         self.q = q/q.mean()              # coeff-> 0:  1 
-
-#     def forward(self, out_all, label_all):
-#         return self.loss_fn(out_all, self.q.diag() @ label_all)
-
-# custom_loss_function = ICM_NG_Loss(params['hparams']['irm_lambda'], train_loaders_iter, args.steps_per_epoch, device)
-   
-# class ICM_oy_ng(ERM):
-
-#     def __init__(self, input_shape, num_classes, num_domains, hparams, network=None, **kwargs):
-#         super(ICM_oy_ng, self).__init__(input_shape, num_classes, num_domains, hparams, **kwargs)
-        
-#     def update(self, data_envs, penalty_loss_fun, unlabeled=None):
-#         all_out = torch.stack([self.predict(x).view(-1) for x, _ in data_envs])
-#         all_y = torch.stack([y.view(-1) for _, y in data_envs])
-#         loss = penalty_loss_fun(all_out, all_y)
-
-#         self.optimizer.zero_grad()
-#         loss.backward()
-#         self.optimizer.step()
-
-#         return {'loss': loss.item()}
