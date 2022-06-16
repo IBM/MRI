@@ -156,26 +156,26 @@ def plot_target_vs_out_angle(model, task_names, iid_loader, ood_loader):
 
         
 ##################
-from IRM_MAML_v5.visualize_hook import Hook
+# from IRM_MAML_v5.visualize_hook import Hook
 
-def concat_to_one_img(tensor):
-    if len(tensor.shape)==4:
-        tensor = torch.cat(tensor.split(1, dim=0),dim=-2).squeeze(0)
-        tensor = torch.cat(tensor.split(1, dim=0),dim=-1).squeeze(0)
-    return tensor
+# def concat_to_one_img(tensor):
+#     if len(tensor.shape)==4:
+#         tensor = torch.cat(tensor.split(1, dim=0),dim=-2).squeeze(0)
+#         tensor = torch.cat(tensor.split(1, dim=0),dim=-1).squeeze(0)
+#     return tensor
 
         
-def get_conv_activations(model, layer, image):
-    """
-    takes a model, a module (specific layer in a met), and an image, and returns the
-    activations at that layer using the Hook class.
-    """
-    hook = Hook(layer)
-    model(image)
-    activations = hook.output.squeeze(0).detach()
-    hook.close()
-#     return activations.clip(min=0)  # ReLU layer
-    return activations
+# def get_conv_activations(model, layer, image):
+#     """
+#     takes a model, a module (specific layer in a met), and an image, and returns the
+#     activations at that layer using the Hook class.
+#     """
+#     hook = Hook(layer)
+#     model(image)
+#     activations = hook.output.squeeze(0).detach()
+#     hook.close()
+# #     return activations.clip(min=0)  # ReLU layer
+#     return activations
 
 # def visualize_conv_layers_with_hook(model, iid_img, ood_img):
 
