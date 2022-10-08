@@ -4,10 +4,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 
-from .labeller import NWayLabeller, NullLabeller
-from .utils_sinusoid import sinusoid, sawtooth, Theta_Sampler #Apply_Offset #Rotate, ThetaNoiser
-
-# from core.decorators import continuous_loader
+from .labeller import NWayLabeller
+from .utils_sinusoid import sinusoid, Theta_Sampler
 
 
 """
@@ -136,9 +134,8 @@ class ShapeTextureGenerator():
     
         
 def get_env_params(params, env, th0): 
-    # th_mean, th_sample = Theta_Sampler(th0, env, params['gen_fnc'].period)
     freq = torch.FloatTensor(th0.shape).uniform_(*params['freq_range'] )
-    ph = torch.FloatTensor(th0.shape).uniform_(0, params['max_phase']) #(0, 1)  # random phase
+    ph = torch.FloatTensor(th0.shape).uniform_(0, params['max_phase']) #(0, 1) # random phase
     return freq, ph
 
     
@@ -168,64 +165,5 @@ def sinusoid_image(fnc1, freq1, th1, ph1, fnc2, freq2, th2, ph2, image_size, bac
     
     out =  s1*s2 
 
-    # out *= (1+background_noise*torch.randn_like(out))  # multiplicative background noise
-    out += background_noise*torch.randn_like(out)        # additive background noise
+    out += background_noise*torch.randn_like(out) # additive background noise
     return out
-#     return out.bernoulli()  # stochastic version
-
-
-
-
-######################
-
-# def get_ShapeTextureDataLoaders(shape_env, texture_envs_dict, total_batch, batch_size=64, feature_type='images', gen_fncs = (sinusoid, sinusoid), n_bins=(0,0), shuffle=True, num_workers=1, **kwargs): 
-#     # can we use more workers? 
-    
-#     """    takes in a texture_envs_dict like 
-#         {   'train' : [[-15, 0, 15]],
-#             'iid_test' : [[-15, 0, 15]],
-#             'ood_test' : [[90]],        }
-
-#     and returns a dictionary with lists of loaders like
-#         {   'train' : [list of loaders],
-#             'iid_test' : [list of loaders],
-#             'ood_test' : [list of loaders],        }
-#     """
-
-
-#     label_fncs = dict(shape = NWayLabeller(n_bin=n_bins[0], mod=gen_fncs[0].period),  
-#                       texture = NWayLabeller(n_bin=n_bins[1], mod=gen_fncs[1].period),
-#                       env_idx = NullLabeller(len(texture_envs_dict['train'])) )  # env_idx is ugly ?
-    
-#     shape_freq_range=(0.04, 0.0401)  # (0.02, 0.03)
-#     texture_freq_range=(0.25, 0.251)  # (0.175, 0.2)
-#     max_phase=0
-# #     max_phase=1
-#     params_shape   = dict(freq_range=shape_freq_range, gen_fnc=gen_fncs[0], n_bin=n_bins[0], max_phase=max_phase) #, period=gen_fncs[0].period)#   **default_params } 
-#     params_texture = dict(freq_range=texture_freq_range, gen_fnc=gen_fncs[1], n_bin=n_bins[1], max_phase=max_phase) #, period=gen_fncs[1].period)#   **default_params } 
-
-#     def helper_fnc(texture_env_list):  # get_ShapeTextureDataLoader
-#         generators = [ ShapeTextureGenerator(params_shape, params_texture, 
-#                                              shape_env = shape_env, texture_env=texture_env, 
-#                                              feature_type=feature_type, **kwargs) 
-#                       for texture_env in texture_env_list]
-    
-#         dataset = ShapeTextureDataset(generators=generators, label_fncs=label_fncs, total_batch=total_batch)
-#         loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-#         return continuous_loader(loader) # if continuous_loading else loader
-
-#     loaders = {}
-#     for key, texture_envs in texture_envs_dict.items():  # key = 'train', 'test' ....
-#         loaders[key] = [helper_fnc(texture_env)  for texture_env in texture_envs  ]
-    
-#     return loaders, label_fncs 
-
-
-# def get_params_envs(iid_list, ood_list, keyword='corr', default_params = {"offset": 0, "std": 0, "corr": 0}):
-
-#     params_envs = {
-#         'train' :  [[ {**default_params, keyword:param}] for param in iid_list], # three separate train loaders (environments)
-#         'iid_test' : [[ {**default_params, keyword:param} for param in iid_list]], # three separate train loaders (environments)
-#         'ood_test' :[[ {**default_params, keyword:param} for param in ood_list]]
-#     }
-#     return params_envs

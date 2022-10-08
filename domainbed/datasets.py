@@ -2,15 +2,12 @@
 
 import os
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageFile
 from torchvision import transforms
 import torchvision.datasets.folder
-from torch.utils.data import Dataset, TensorDataset, Subset
+from torch.utils.data import TensorDataset, Subset
 from torchvision.datasets import MNIST, ImageFolder
 from torchvision.transforms.functional import rotate
-
-# from datamodules.sinusoid_datamodule_v2 import ShapeTextureGenerator, NWayLabeller, sinusoid, sawtooth
 
 # from wilds.datasets.camelyon17_dataset import Camelyon17Dataset
 # from wilds.datasets.fmow_dataset import FMoWDataset
@@ -19,21 +16,10 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 DATASETS = [
     # Debug
-    # "Debug28",
-    # "Debug224",
-    # Linear
-    # "FactoredCMNIST",
-    # Shape Texture
-    # "ShapeTexture",
-    # "ShapeTexture_corr",
-    # "ShapeTexture_corr0",
-    # "ShapeTexture_offset1",
-    # "ShapeTexture_offset2",
-    # "ShapeTexture_std",
+    "Debug28",
+    "Debug224",
     # Small images
     "ColoredMNIST",
-    # "CSColoredMNIST",
-    "CSMultiColoredMNIST",
     "RotatedMNIST",
     # Big images
     "VLCS",
@@ -41,10 +27,10 @@ DATASETS = [
     "OfficeHome",
     "TerraIncognita",
     "DomainNet",
-    # "SVIRO",
-    # # WILDS datasets
-    # "WILDSCamelyon",
-    # "WILDSFMoW"
+    "SVIRO",
+    # WILDS datasets
+    "WILDSCamelyon",
+    "WILDSFMoW"
 ]
 
 def get_dataset_class(dataset_name):
@@ -86,11 +72,9 @@ class Debug(MultipleDomainDataset):
                 )
             )
 
-
 class Debug28(Debug):
     INPUT_SHAPE = (3, 28, 28)
     ENVIRONMENTS = ['0', '1', '2']
-
 
 class Debug224(Debug):
     INPUT_SHAPE = (3, 224, 224)
@@ -98,12 +82,11 @@ class Debug224(Debug):
 
 
 class MultipleEnvironmentMNIST(MultipleDomainDataset):
-    def __init__(self, root, environments, test_envs, augment, dataset_transform, input_shape, num_classes, total_batch):
+    def __init__(self, root, environments, dataset_transform, input_shape,
+                 num_classes):
         super().__init__()
         if root is None:
             raise ValueError('Data directory not specified!')
-        
-        self.ENVIRONMENTS = [str(env) for env in environments]
 
         original_dataset_tr = MNIST(root, train=True, download=True)
         original_dataset_te = MNIST(root, train=False, download=True)
@@ -114,78 +97,40 @@ class MultipleEnvironmentMNIST(MultipleDomainDataset):
         original_labels = torch.cat((original_dataset_tr.targets,
                                      original_dataset_te.targets))
 
-        shuffle = torch.randperm(len(original_images))[:total_batch] #[::2]
-        
+        shuffle = torch.randperm(len(original_images))
+
         original_images = original_images[shuffle]
         original_labels = original_labels[shuffle]
-        
+
         self.datasets = []
-        
-        augment_transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.RandomAffine(degrees=30, translate=(0.1, 0.1), scale=(0.8, 1.2)),
-            transforms.ToTensor()]
-        )
-        
-        for i, env in enumerate(environments):
+
+        for i in range(len(environments)):
             images = original_images[i::len(environments)]
             labels = original_labels[i::len(environments)]
-            if augment and (i not in test_envs):
-                env_transform = augment_transform
-            else:
-                env_transform = None
-            self.datasets.append(dataset_transform(images, labels, env, env_transform))
+            self.datasets.append(dataset_transform(images, labels, environments[i]))
+
         self.input_shape = input_shape
         self.num_classes = num_classes
 
-        
-class CustomTensorDataset(Dataset):
-    """TensorDataset with support of transforms.
-    """
-    def __init__(self, tensors, transform=None):
-        assert all(tensors[0].size(0) == tensor.size(0) for tensor in tensors)
-        self.tensors = tensors
-        self.transform = transform
-
-    def __getitem__(self, index):
-        x = self.tensors[0][index]
-
-        if self.transform:
-            x = self.transform(x)
-    
-        y = self.tensors[1][index]
-
-        return x, y
-
-    def __len__(self):
-        return self.tensors[0].size(0)
-    
 
 class ColoredMNIST(MultipleEnvironmentMNIST):
-#     ENVIRONMENTS = ['+90%', '+80%', '-90%']
-    env_param_list = [0.9, 0.1, 0.2]
+    ENVIRONMENTS = ['+90%', '+80%', '-90%']
 
     def __init__(self, root, test_envs, hparams):
-        self.causal_param = hparams.get('causal_param', 0.75)
-        total_batch = hparams.get('total_batch', None)
-        env_param_list = hparams.get('env_param_list', self.env_param_list)
-        augment = hparams.get('data_augmentation', False)
-        if hparams['loss_type'] == 'binary_classification':
-            num_classes_ = 1
-        else:
-            num_classes_ = 2
-        super().__init__(root, env_param_list, test_envs, augment, 
-                         self.color_dataset, (2, 28, 28,), num_classes_, total_batch)
+        super(ColoredMNIST, self).__init__(root, [0.1, 0.2, 0.9],
+                                         self.color_dataset, (2, 28, 28,), 2)
 
-    def color_dataset(self, images, labels, environment, transform):
+        self.input_shape = (2, 28, 28,)
+        self.num_classes = 2
+
+    def color_dataset(self, images, labels, environment):
         # # Subsample 2x for computational convenience
         # images = images.reshape((-1, 28, 28))[:, ::2, ::2]
         # Assign a binary label based on the digit
         labels = (labels < 5).float()
         # Flip label with probability 0.25
         labels = self.torch_xor_(labels,
-                                 self.torch_bernoulli_(1-self.causal_param,
-                                                       len(labels)))
+                                 self.torch_bernoulli_(0.25, len(labels)))
 
         # Assign a color based on the label; flip the color with probability e
         colors = self.torch_xor_(labels,
@@ -195,159 +140,27 @@ class ColoredMNIST(MultipleEnvironmentMNIST):
         # Apply the color to the image by zeroing out the other color channel
         images[torch.tensor(range(len(images))), (
             1 - colors).long(), :, :] *= 0
-        
+
         x = images.float().div_(255.0)
         y = labels.view(-1).long()
 
-        return CustomTensorDataset(tensors=(x, y), transform=transform)
+        return TensorDataset(x, y)
 
     def torch_bernoulli_(self, p, size):
         return (torch.rand(size) < p).float()
 
     def torch_xor_(self, a, b):
         return (a - b).abs()
-    
-    
-# class CSColoredMNIST(MultipleEnvironmentMNIST):
-# #     ENVIRONMENTS = ['+90%', '+80%', '-90%']
-#     env_param_list = [0.9, 0.1, 0.2]
-
-#     def __init__(self, root, test_envs, hparams):
-#         env_param_list = hparams.get('env_param_list', self.env_param_list)
-#         augment = hparams.get('data_augmentation', None) 
-#         super().__init__(root, env_param_list, test_envs, augment, self.color_dataset, (2, 28, 28,), 2)
-
-#     def color_dataset(self, images, labels, environment, transform):
-#         # # Subsample 2x for computational convenience
-#         # images = images.reshape((-1, 28, 28))[:, ::2, ::2]
-#         # Assign a binary label based on the digit
-#         labels = (labels < 5).float()
-
-#         colors = self.torch_bernoulli_(
-#             0.5, len(labels)).float()  # sample color for each sample
-
-#         w_comb = 1 - self.torch_xor_(labels, colors)  # compute xor of label and
-#         # color and negate it
-
-#         selection_0 = torch.nonzero(w_comb == 0, as_tuple=True)[0]  # indices
-#         # where -xor is zero
-#         selection_1 = torch.nonzero(w_comb == 1, as_tuple=True)[0]  # indices
-#         # were -xor is one
-
-#         ns0 = len(selection_0)
-#         ns1 = len(selection_1)
-
-#         final_selection_0 = selection_0[
-#             torch.nonzero(self.torch_bernoulli_(environment, ns0) == 1,
-#                           as_tuple=True)[0]]  # -xor =0 then select that point
-#         # with probability prob_e
-
-#         final_selection_1 = selection_1[
-#             torch.nonzero(self.torch_bernoulli_(1 - environment, ns1) == 1,
-#                           as_tuple=True)[0]] # -xor =0 then select that point
-#         # with probability 1-prob_e
-
-#         final_selection = torch.cat((final_selection_0, final_selection_1))
-#         # indices of the final set of points selected
-
-#         colors = colors[final_selection]  # colors of the final set
-#         # of selected points
-#         labels = labels[final_selection]  # labels of the final set of selected
-#         # points
-#         images = images[final_selection]  # gray scale image of the
-#         # final set of selected points
-
-#         images = torch.stack([images, images], dim=1)
-#         # Apply the color to the image by zeroing out the other color channel
-#         images[torch.tensor(range(len(images))), (
-#             1 - colors).long(), :, :] *= 0
-
-#         x = images.float().div_(255.0)
-#         y = labels.view(-1).long()
-
-#         return CustomTensorDataset(tensors=(x, y), transform=transform)
-
-#     def torch_bernoulli_(self, p, size):
-#         return (torch.rand(size) < p).float()
-
-#     def torch_xor_(self, a, b):
-#         return (a - b).abs()
-
-
-# class CSMultiColoredMNIST(MultipleEnvironmentMNIST):
-# #     ENVIRONMENTS = ['+100%', '+90%', '0%']
-#     env_param_list = [0.0, 1.0, 0.9]
-
-#     def __init__(self, root, test_envs, hparams):
-#         env_param_list = hparams.get('env_param_list', self.env_param_list)
-#         augment = hparams.get('data_augmentation', None) 
-#         self.env_seed = 1
-#         self.colors = torch.FloatTensor(
-#             [[0, 100, 0], [188, 143, 143], [255, 0, 0], [255, 215, 0],
-#              [0, 255, 0], [65, 105, 225], [0, 225, 225],
-#              [0, 0, 255], [255, 20, 147], [160, 160, 160]])
-#         self.random_colors = torch.randint(255, (10, 3)).float()
-        
-#         super().__init__(root, env_param_list, test_envs, augment, self.color_dataset, (3, 28, 28,), 10)
-
-
-#     def color_dataset(self, images, labels, environment, transform):
-#         original_seed = torch.cuda.initial_seed()
-#         torch.manual_seed(self.env_seed)
-#         shuffle = torch.randperm(len(self.colors))
-#         self.colors_ = self.colors[shuffle]
-#         torch.manual_seed(self.env_seed)
-#         ber = self.torch_bernoulli_(environment, len(labels))
-#         # print("ber:", len(ber), sum(ber))
-#         torch.manual_seed(original_seed)
-
-#         images = torch.stack([images, images, images], dim=1)
-#         # binarize the images
-#         images = (images > 0).float()
-#         y = labels.view(-1).long()
-#         color_label = torch.zeros_like(y).long()
-
-#         # Apply the color to the image
-#         for img_idx in range(len(images)):
-#             if ber[img_idx] > 0:
-#                 color_label[img_idx] = labels[img_idx]
-#                 for channels in range(3):
-#                     images[img_idx, channels, :, :] = images[img_idx, channels, :,
-#                                                       :] * \
-#                                                       self.colors_[labels[
-#                                                                        img_idx].long(), channels]
-#             else:
-#                 color = torch.randint(10, [1])[
-#                     0]  # random color, regardless of label
-#                 color_label[img_idx] = color
-#                 for channels in range(3):
-#                     images[img_idx, channels, :, :] = images[img_idx, channels, :,
-#                                                       :] * self.colors_[
-#                                                           color, channels]
-
-#         x = images.float().div_(255.0)
-
-#         return CustomTensorDataset(tensors=(x, y), transform=transform)
-
-#     def torch_bernoulli_(self, p, size):
-#         return (torch.rand(size) < p).float()
-
-#     def torch_xor_(self, a, b):
-#         return (a - b).abs()
-
 
 
 class RotatedMNIST(MultipleEnvironmentMNIST):
-    env_param_list = [0, 15, 30, 45, 60, 75]
+    ENVIRONMENTS = ['0', '15', '30', '45', '60', '75']
 
     def __init__(self, root, test_envs, hparams):
-        total_batch = hparams.get('total_batch', None)
-        env_param_list = hparams['env_param_list'] or self.env_param_list
-        augment = False
-        super().__init__(root, env_param_list, test_envs, augment,
-                         self.rotate_dataset, (1, 28, 28,), 10, total_batch)
+        super(RotatedMNIST, self).__init__(root, [0, 15, 30, 45, 60, 75],
+                                           self.rotate_dataset, (1, 28, 28,), 10)
 
-    def rotate_dataset(self, images, labels, angle, transform):
+    def rotate_dataset(self, images, labels, angle):
         rotation = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Lambda(lambda x: rotate(x, angle, fill=(0,),

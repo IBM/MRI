@@ -1,0 +1,23 @@
+# This file may be used to create an environment using:
+# python=3.9.7
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==1.10.0+cu113
+gdown==4.5.1
+imageio==2.13.4
+keras==2.7.0
+matplotlib==3.4.3
+pandas==1.4.0
+pillow==8.4.0
+plotly==5.4.0
+protobuf==3.15.8
+scikit-learn==1.1.1
+scipy==1.7.3
+seaborn==0.11.2
+sympy==1.9
+tensorboard==2.7.0
+tqdm==4.62.3
+numpy==1.21.2
+pytorch-lightning==1.5.10
+ipykernel==5.5.5
+ipywidgets==7.6.5
+jupyterlab==3.2.4

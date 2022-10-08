@@ -4,24 +4,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
-# from torch.autograd import Variable
+from torch.autograd import Variable
 
 import copy
 import numpy as np
-# from collections import OrderedDict #, defaultdict
+from collections import defaultdict, OrderedDict
+try:
+    from backpack import backpack, extend
+    from backpack.extensions import BatchGrad
+except:
+    backpack = None
 
 from domainbed import networks
 from domainbed.networks import get_network
-from domainbed.lib.misc import random_pairs_of_minibatches, ParamDict
+from domainbed.lib.misc import (
+    random_pairs_of_minibatches, ParamDict, MovingAverage, l2_between_dicts
+)
+
 
 ALGORITHMS = [
     'ERM',
-    'ICM_oy_ng',
     'Fish',
-    'IRM',     #'IRM_nodummy',     'IRM0', 'IRM2',
-    # 'ICM_oo_oy', 'ICM_oo_oy_adaptive', 'ICM_oy', 'ICM_oy_adaptive', 'ICM_oo' #, 'IRM_var_12', 'IRM_var_012', 'IRM_var_Best',
-    'IB_ERM',
-    'IB_IRM',
+    'IRM',
     'GroupDRO',
     'Mixup',
     'MLDG',
@@ -36,9 +40,16 @@ ALGORITHMS = [
     'RSC',
     'SD',
     'ANDMask',
-    'SANDMask',    # SAND-mask
+    'SANDMask',
     'IGA',
-    'SelfReg'
+    'SelfReg',
+    "Fishr",
+    'TRM',
+    'IB_ERM',
+    'IB_IRM',
+    'CAD',
+    'CondCAD',
+    'Transfer', 
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -50,17 +61,17 @@ def get_algorithm_class(algorithm_name):
 
 def get_optimizer(hparams, parameters):        
     if hparams['optim'] == 'SGD':
-        optimizer = torch.optim.SGD(    parameters,
-                                        lr=hparams["lr"],
-                                        momentum=hparams["momentum"],
-                                        weight_decay=hparams['weight_decay'] )
+        optimizer = torch.optim.SGD(parameters,
+                                    lr=hparams["lr"],
+                                    momentum=hparams["momentum"],
+                                    weight_decay=hparams['weight_decay'])
     else:
-        optimizer = torch.optim.Adam(   parameters,
-                                        lr=hparams["lr"],
-#                                         betas=(0.9 , 0.999), 
-                                        betas=(hparams["momentum"], 0.999),
-                                        weight_decay=hparams['weight_decay'] )
+        optimizer = torch.optim.Adam(parameters,
+                                     lr=hparams["lr"],
+                                     betas=(hparams["momentum"], 0.999),
+                                     weight_decay=hparams['weight_decay'])
     return optimizer
+
 
 def get_loss_fn(hparams):
     assert hparams['loss_type'] in ['classification', 'binary_classification', 'regression', 'regression_complex',]
@@ -84,6 +95,7 @@ def get_loss_fn(hparams):
     else:
         raise ValueError()
 
+        
 class Algorithm(torch.nn.Module):
     """
     A subclass of Algorithm implements a domain generalization algorithm.
@@ -140,23 +152,25 @@ class ERM(Algorithm):
     def predict(self, x):
         return self.network(x)
 
-#     def compute_test_loss(self, logits, y):
-#         loss = self.loss_fn(logits, y)
-#         return loss
-    
+
 class Fish(Algorithm):
     """
     Implementation of Fish, as seen in Gradient Matching for Domain 
     Generalization, Shi et al. 2021.
     """
 
-    def __init__(self, input_shape, num_classes, num_domains, hparams, network=None, **kwargs):
-        super(Fish, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(Fish, self).__init__(input_shape, num_classes, num_domains,
+                                   hparams)
         self.input_shape = input_shape
         self.num_classes = num_classes
 
-        self.network = network or networks.WholeFish(input_shape, num_classes, hparams)
-        self.optimizer = get_optimizer(self.hparams, self.network.parameters())
+        self.network = networks.WholeFish(input_shape, num_classes, hparams)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
         self.optimizer_inner_state = None
 
     def create_clone(self, device):
@@ -176,11 +190,11 @@ class Fish(Algorithm):
         meta_weights += lr_meta * (inner_weights - meta_weights)
         return meta_weights
 
-    def update(self, data_envs, unlabeled=None):
-        self.create_clone(data_envs[0][0].device)
+    def update(self, minibatches, unlabeled=None):
+        self.create_clone(minibatches[0][0].device)
 
-        for x, y in data_envs:
-            loss = self.loss_fn(self.network_inner(x), y)
+        for x, y in minibatches:
+            loss = F.cross_entropy(self.network_inner(x), y)
             self.optimizer_inner.zero_grad()
             loss.backward()
             self.optimizer_inner.step()
@@ -201,10 +215,11 @@ class Fish(Algorithm):
 
 class ARM(ERM):
     """ Adaptive Risk Minimization (ARM) """
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
         original_input_shape = input_shape
         input_shape = (1 + original_input_shape[0],) + original_input_shape[1:]
-        super(ARM, self).__init__(input_shape, num_classes, num_domains,  hparams)
+        super(ARM, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
         self.context_net = networks.ContextNet(original_input_shape)
         self.support_size = hparams['batch_size']
 
@@ -222,44 +237,52 @@ class ARM(ERM):
         x = torch.cat([x, context], dim=1)
         return self.network(x)
 
-################### Check if this works for regression
+
 class AbstractDANN(Algorithm):
     """Domain-Adversarial Neural Networks (abstract class)"""
 
     def __init__(self, input_shape, num_classes, num_domains,
-                 hparams, conditional, class_balance, network=None):
+                 hparams, conditional, class_balance):
 
-        super(AbstractDANN, self).__init__(input_shape, num_classes, num_domains, hparams)
+        super(AbstractDANN, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
 
         self.register_buffer('update_count', torch.tensor([0]))
         self.conditional = conditional
         self.class_balance = class_balance
 
         # Algorithms
-        self.network = network or get_network(input_shape, num_classes, hparams)
-        self.discriminator = networks.MLP(self.network.featurizer.n_outputs, num_domains, self.hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+        self.discriminator = networks.MLP(self.featurizer.n_outputs,
+            num_domains, self.hparams)
         self.class_embeddings = nn.Embedding(num_classes,
-            self.network.featurizer.n_outputs)
+            self.featurizer.n_outputs)
 
         # Optimizers
         self.disc_opt = torch.optim.Adam(
-            (list(self.discriminator.parameters()) + list(self.class_embeddings.parameters())),
+            (list(self.discriminator.parameters()) +
+                list(self.class_embeddings.parameters())),
             lr=self.hparams["lr_d"],
             weight_decay=self.hparams['weight_decay_d'],
             betas=(self.hparams['beta1'], 0.9))
 
         self.gen_opt = torch.optim.Adam(
-            self.network.parameters(),
+            (list(self.featurizer.parameters()) +
+                list(self.classifier.parameters())),
             lr=self.hparams["lr_g"],
             weight_decay=self.hparams['weight_decay_g'],
             betas=(self.hparams['beta1'], 0.9))
 
-    def update(self, data_envs, unlabeled=None):
-        device = "cuda" if data_envs[0][0].is_cuda else "cpu"
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
         self.update_count += 1
-        all_x = torch.cat([x for x, _ in data_envs])
-        all_y = torch.cat([y for _, y in data_envs])
-        all_z = self.network.featurizer(all_x)
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        all_z = self.featurizer(all_x)
         if self.conditional:
             disc_input = all_z + self.class_embeddings(all_y)
         else:
@@ -267,16 +290,16 @@ class AbstractDANN(Algorithm):
         disc_out = self.discriminator(disc_input)
         disc_labels = torch.cat([
             torch.full((x.shape[0], ), i, dtype=torch.int64, device=device)
-            for i, (x, y) in enumerate(data_envs)
+            for i, (x, y) in enumerate(minibatches)
         ])
 
         if self.class_balance:
             y_counts = F.one_hot(all_y).sum(dim=0)
             weights = 1. / (y_counts[all_y] * y_counts.shape[0]).float()
-            disc_loss = self.loss_fn(disc_out, disc_labels, reduction='none')
+            disc_loss = F.cross_entropy(disc_out, disc_labels, reduction='none')
             disc_loss = (weights * disc_loss).sum()
         else:
-            disc_loss = self.loss_fn(disc_out, disc_labels)
+            disc_loss = F.cross_entropy(disc_out, disc_labels)
 
         disc_softmax = F.softmax(disc_out, dim=1)
         input_grad = autograd.grad(disc_softmax[:, disc_labels].sum(),
@@ -292,8 +315,8 @@ class AbstractDANN(Algorithm):
             self.disc_opt.step()
             return {'disc_loss': disc_loss.item()}
         else:
-            all_preds = self.network.classifier(all_z)
-            classifier_loss = self.loss_fn(all_preds, all_y)
+            all_preds = self.classifier(all_z)
+            classifier_loss = F.cross_entropy(all_preds, all_y)
             gen_loss = (classifier_loss +
                         (self.hparams['lambda'] * -disc_loss))
             self.disc_opt.zero_grad()
@@ -303,226 +326,86 @@ class AbstractDANN(Algorithm):
             return {'gen_loss': gen_loss.item()}
 
     def predict(self, x):
-        return self.network(x)
+        return self.classifier(self.featurizer(x))
 
 class DANN(AbstractDANN):
     """Unconditional DANN"""
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(DANN, self).__init__(input_shape, num_classes, num_domains,
             hparams, conditional=False, class_balance=False)
 
 
 class CDANN(AbstractDANN):
     """Conditional DANN"""
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CDANN, self).__init__(input_shape, num_classes, num_domains,
             hparams, conditional=True, class_balance=True)
 
 
+# class IRM(ERM):
+#     """Invariant Risk Minimization"""
 
-class IRM_domainbed(ERM):
-    """Invariant Risk Minimization"""
+#     def __init__(self, input_shape, num_classes, num_domains, hparams):
+#         super(IRM, self).__init__(input_shape, num_classes, num_domains,
+#                                   hparams)
+#         self.register_buffer('update_count', torch.tensor([0]))
 
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(IRM, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
-        self.register_buffer('update_count', torch.tensor([0]))
+#     @staticmethod
+#     def _irm_penalty(logits, y):
+#         device = "cuda" if logits[0][0].is_cuda else "cpu"
+#         scale = torch.tensor(1.).to(device).requires_grad_()
+#         loss_1 = F.cross_entropy(logits[::2] * scale, y[::2])
+#         loss_2 = F.cross_entropy(logits[1::2] * scale, y[1::2])
+#         grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
+#         grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
+#         result = torch.sum(grad_1 * grad_2)
+#         return result
 
-    # @staticmethod
-    def _irm_penalty(self, logits, y):
-        # device = "cuda" if logits[0][0].is_cuda else "cpu"
-        scale = torch.tensor(1.).to(logits.device).requires_grad_()
-        even_indices = torch.arange(0, len(y), 2)
-        odd_indices = torch.arange(1, len(y), 2)
-        loss_1 = self.loss_fn(logits[even_indices] * scale, y[even_indices]) 
-        loss_2 = self.loss_fn(logits[odd_indices] * scale, y[odd_indices])
-        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
-        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
-        result = torch.sum(grad_1 * grad_2)
-        return result
-    
-    def compute_loss(self, minibatches):
-        nll = 0.
-        penalty = 0.
-        
-        all_x = torch.cat([x for x,y in minibatches])
-        all_logits = self.network(all_x)
-        all_logits_idx = 0
-        for i, (x, y) in enumerate(minibatches):
-            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
-            all_logits_idx += x.shape[0]
-            nll += self.loss_fn(logits, y) #F.cross_entropy(logits, y)
-            penalty += self._irm_penalty(logits, y)
-        nll /= len(minibatches)
-        penalty /= len(minibatches)
-        return nll, penalty, len(minibatches)
-        
+#     def update(self, minibatches, unlabeled=None):
+#         device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+#         penalty_weight = (self.hparams['irm_lambda'] if self.update_count
+#                           >= self.hparams['irm_penalty_anneal_iters'] else
+#                           1.0)
+#         nll = 0.
+#         penalty = 0.
 
-    def update(self, minibatches, unlabeled=None):
-        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
-        penalty_weight = (self.hparams['irm_lambda'] if self.update_count
-                          >= self.hparams['irm_penalty_anneal_iters'] else
-                          1.0)
-        # nll = 0.
-        # penalty = 0.
+#         all_x = torch.cat([x for x,y in minibatches])
+#         all_logits = self.network(all_x)
+#         all_logits_idx = 0
+#         for i, (x, y) in enumerate(minibatches):
+#             logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
+#             all_logits_idx += x.shape[0]
+#             nll += F.cross_entropy(logits, y)
+#             penalty += self._irm_penalty(logits, y)
+#         nll /= len(minibatches)
+#         penalty /= len(minibatches)
+#         loss = nll + (penalty_weight * penalty)
 
-        # all_x = torch.cat([x for x,y in minibatches])
-        # all_logits = self.network(all_x)
-        # all_logits_idx = 0
-        # for i, (x, y) in enumerate(minibatches):
-        #     logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
-        #     all_logits_idx += x.shape[0]
-        #     nll += self.loss_fn(logits, y) #F.cross_entropy(logits, y)
-        #     penalty += self._irm_penalty(logits, y)
-        # nll /= len(minibatches)
-        # penalty /= len(minibatches)
-        
-        nll, penalty, *_ = self.compute_loss(minibatches)
-        loss = nll + (penalty_weight * penalty)
+#         if self.update_count == self.hparams['irm_penalty_anneal_iters']:
+#             # Reset Adam, because it doesn't like the sharp jump in gradient
+#             # magnitudes that happens at this step.
+#             self.optimizer = torch.optim.Adam(
+#                 self.network.parameters(),
+#                 lr=self.hparams["lr"],
+#                 weight_decay=self.hparams['weight_decay'])
 
-        if self.update_count == self.hparams['irm_penalty_anneal_iters']:
-            # Reset Adam, because it doesn't like the sharp jump in gradient
-            # magnitudes that happens at this step.
-            self.optimizer = torch.optim.Adam(
-                self.network.parameters(),
-                lr=self.hparams["lr"],
-                weight_decay=self.hparams['weight_decay'])
+#         self.optimizer.zero_grad()
+#         loss.backward()
+#         self.optimizer.step()
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        self.update_count += 1
-        return {'loss': loss.item(), 'nll': nll.item(),
-            'penalty': penalty.item()}
-    
-    
-
-class IB_ERM(ERM):
-    """Information Bottleneck based ERM on feature with conditionning"""
-
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(IB_ERM, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
-        self.optimizer = get_optimizer(self.hparams, self.network.parameters())
-        self.register_buffer('update_count', torch.tensor([0]))
-
-    def update(self, data_envs, unlabeled=None):
-        device = "cuda" if data_envs[0][0].is_cuda else "cpu"
-        ib_penalty_weight = (self.hparams['ib_lambda'] if self.update_count
-                          >= self.hparams['ib_penalty_anneal_iters'] else
-                          0.0)
-
-        nll = 0.
-        ib_penalty = 0.
-
-        all_x = torch.cat([x for x,y in data_envs])
-        all_features = self.network.featurizer(all_x)
-        all_logits = self.network.classifier(all_features)
-        all_logits_idx = 0
-        for i, (x, y) in enumerate(data_envs):
-            features = all_features[all_logits_idx:all_logits_idx + x.shape[0]]
-            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
-            all_logits_idx += x.shape[0]
-            nll += self.loss_fn(logits, y)
-            ib_penalty += features.var(dim=0).mean()
-
-        nll /= len(data_envs)
-        ib_penalty /= len(data_envs)
-
-        # Compile loss
-        loss = nll
-        loss += ib_penalty_weight * ib_penalty
-
-        if self.update_count == self.hparams['ib_penalty_anneal_iters']:
-            # Reset Adam, because it doesn't like the sharp jump in gradient
-            # magnitudes that happens at this step.
-            self.optimizer = get_optimizer(self.hparams, self.network.parameters())
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        self.update_count += 1
-        return {'loss': loss.item(),
-                'nll': nll.item(),
-                'IB_penalty': ib_penalty.item()}
-
-
-class IB_IRM(ERM):
-    """Information Bottleneck based IRM on feature with conditionning"""
-
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(IB_IRM, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
-        self.optimizer = get_optimizer(self.hparams, self.network.parameters())
-        self.register_buffer('update_count', torch.tensor([0]))
-
-    @staticmethod
-    def _irm_penalty(logits, y):
-        device = "cuda" if logits[0][0].is_cuda else "cpu"
-        scale = torch.tensor(1.).to(device).requires_grad_()
-        loss_1 = self.loss_fn(logits[::2] * scale, y[::2])
-        loss_2 = self.loss_fn(logits[1::2] * scale, y[1::2])
-        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
-        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
-        result = torch.sum(grad_1 * grad_2)
-        return result
-
-    def update(self, data_envs, unlabeled=None):
-        device = "cuda" if data_envs[0][0].is_cuda else "cpu"
-        irm_penalty_weight = (self.hparams['irm_lambda'] if self.update_count
-                          >= self.hparams['irm_penalty_anneal_iters'] else
-                          1.0)
-        ib_penalty_weight = (self.hparams['ib_lambda'] if self.update_count
-                          >= self.hparams['ib_penalty_anneal_iters'] else
-                          0.0)
-
-        nll = 0.
-        irm_penalty = 0.
-        ib_penalty = 0.
-
-        all_x = torch.cat([x for x,y in data_envs])
-        all_features = self.network.featurizer(all_x)
-        all_logits = self.network.classifier(all_features)
-        all_logits_idx = 0
-        for i, (x, y) in enumerate(data_envs):
-            features = all_features[all_logits_idx:all_logits_idx + x.shape[0]]
-            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
-            all_logits_idx += x.shape[0]
-            nll += self.loss_fn(logits, y)
-            irm_penalty += self._irm_penalty(logits, y)
-            ib_penalty += features.var(dim=0).mean()
-
-        nll /= len(data_envs)
-        irm_penalty /= len(data_envs)
-        ib_penalty /= len(data_envs)
-
-        # Compile loss
-        loss = nll
-        loss += irm_penalty_weight * irm_penalty
-        loss += ib_penalty_weight * ib_penalty
-
-        if self.update_count == self.hparams['irm_penalty_anneal_iters'] or self.update_count == self.hparams['ib_penalty_anneal_iters']:
-            # Reset Adam, because it doesn't like the sharp jump in gradient
-            # magnitudes that happens at this step.
-            self.optimizer = get_optimizer(self.hparams, self.network.parameters())
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        self.update_count += 1
-        return {'loss': loss.item(),
-                'nll': nll.item(),
-                'IRM_penalty': irm_penalty.item(),
-                'IB_penalty': ib_penalty.item()}
+#         self.update_count += 1
+#         return {'loss': loss.item(), 'nll': nll.item(),
+#             'penalty': penalty.item()}
 
 
 class VREx(ERM):
     """V-REx algorithm from http://arxiv.org/abs/2003.00688"""
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(VREx, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(VREx, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
         self.register_buffer('update_count', torch.tensor([0]))
 
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
         if self.update_count >= self.hparams["vrex_penalty_anneal_iters"]:
             penalty_weight = self.hparams["vrex_lambda"]
         else:
@@ -530,14 +413,14 @@ class VREx(ERM):
 
         nll = 0.
 
-        all_x = torch.cat([x for x, y in data_envs])
+        all_x = torch.cat([x for x, y in minibatches])
         all_logits = self.network(all_x)
         all_logits_idx = 0
-        losses = torch.zeros(len(data_envs))
-        for i, (x, y) in enumerate(data_envs):
+        losses = torch.zeros(len(minibatches))
+        for i, (x, y) in enumerate(minibatches):
             logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
             all_logits_idx += x.shape[0]
-            nll = self.loss_fn(logits, y)
+            nll = F.cross_entropy(logits, y)
             losses[i] = nll
 
         mean = losses.mean()
@@ -547,7 +430,10 @@ class VREx(ERM):
         if self.update_count == self.hparams['vrex_penalty_anneal_iters']:
             # Reset Adam (like IRM), because it doesn't like the sharp jump in
             # gradient magnitudes that happens at this step.
-            self.optimizer = get_optimizer(self.hparams, self.network.parameters())
+            self.optimizer = torch.optim.Adam(
+                self.network.parameters(),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay'])
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -564,23 +450,24 @@ class Mixup(ERM):
     https://arxiv.org/pdf/2001.00677.pdf
     https://arxiv.org/pdf/1912.01805.pdf
     """
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(Mixup, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(Mixup, self).__init__(input_shape, num_classes, num_domains,
+                                    hparams)
 
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
         objective = 0
 
-        for (xi, yi), (xj, yj) in random_pairs_of_minibatches(data_envs):
+        for (xi, yi), (xj, yj) in random_pairs_of_minibatches(minibatches):
             lam = np.random.beta(self.hparams["mixup_alpha"],
                                  self.hparams["mixup_alpha"])
 
             x = lam * xi + (1 - lam) * xj
             predictions = self.predict(x)
 
-            objective += lam * self.loss_fn(predictions, yi)
-            objective += (1 - lam) * self.loss_fn(predictions, yj)
+            objective += lam * F.cross_entropy(predictions, yi)
+            objective += (1 - lam) * F.cross_entropy(predictions, yj)
 
-        objective /= len(data_envs)
+        objective /= len(minibatches)
 
         self.optimizer.zero_grad()
         objective.backward()
@@ -595,20 +482,21 @@ class GroupDRO(ERM):
     Algorithm 1 from [https://arxiv.org/pdf/1911.08731.pdf]
     """
     def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(GroupDRO, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+        super(GroupDRO, self).__init__(input_shape, num_classes, num_domains,
+                                        hparams, **kwargs)
         self.register_buffer("q", torch.Tensor())
 
-    def update(self, data_envs, unlabeled=None):
-        device = "cuda" if data_envs[0][0].is_cuda else "cpu"
+    def update(self, minibatches, unlabeled=None):
+        device = self.device #"cuda" if minibatches[0][0].is_cuda else "cpu"
 
         if not len(self.q):
-            self.q = torch.ones(len(data_envs)).to(device)
+            self.q = torch.ones(len(minibatches)).to(device)
 
-        losses = torch.zeros(len(data_envs)).to(device)
+        losses = torch.zeros(len(minibatches)).to(device)
 
-        for m in range(len(data_envs)):
-            x, y = data_envs[m]
-            losses[m] = self.loss_fn(self.predict(x), y)
+        for m in range(len(minibatches)):
+            x, y = minibatches[m]
+            losses[m] = F.cross_entropy(self.predict(x), y)
             self.q[m] *= (self.hparams["groupdro_eta"] * losses[m].data).exp()
 
         self.q /= self.q.sum()
@@ -629,10 +517,11 @@ class MLDG(ERM):
     Related: https://arxiv.org/pdf/1703.03400.pdf
     Related: https://arxiv.org/pdf/1910.13580.pdf
     """
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(MLDG, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
-
-    def update(self, data_envs, unlabeled=None):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(MLDG, self).__init__(input_shape, num_classes, num_domains,
+                                   hparams)
+        self.num_meta_test = hparams['n_meta_test']
+    def update(self, minibatches, unlabeled=None):
         """
         Terms being computed:
             * Li = Loss(xi, yi, params)
@@ -648,7 +537,7 @@ class MLDG(ERM):
 
         For computational efficiency, we do not compute second derivatives.
         """
-        num_mb = len(data_envs)
+        num_mb = len(minibatches)
         objective = 0
 
         self.optimizer.zero_grad()
@@ -656,7 +545,7 @@ class MLDG(ERM):
             if p.grad is None:
                 p.grad = torch.zeros_like(p)
 
-        for (xi, yi), (xj, yj) in random_pairs_of_minibatches(data_envs):
+        for (xi, yi), (xj, yj) in split_meta_train_test(minibatches, self.num_meta_test):
             # fine tune clone-network on task "i"
             inner_net = copy.deepcopy(self.network)
 
@@ -666,7 +555,7 @@ class MLDG(ERM):
                 weight_decay=self.hparams['weight_decay']
             )
 
-            inner_obj = self.loss_fn(inner_net(xi), yi)
+            inner_obj = F.cross_entropy(inner_net(xi), yi)
 
             inner_opt.zero_grad()
             inner_obj.backward()
@@ -683,7 +572,7 @@ class MLDG(ERM):
             objective += inner_obj.item()
 
             # this computes Gj on the clone-network
-            loss_inner_j = self.loss_fn(inner_net(xj), yj)
+            loss_inner_j = F.cross_entropy(inner_net(xj), yj)
             grad_inner_j = autograd.grad(loss_inner_j, inner_net.parameters(),
                 allow_unused=True)
 
@@ -698,7 +587,7 @@ class MLDG(ERM):
             # The network has now accumulated gradients Gi + beta * Gj
             # Repeat for all train-test splits, do .step()
 
-        objective /= len(data_envs)
+        objective /= len(minibatches)
 
         self.optimizer.step()
 
@@ -710,7 +599,7 @@ class MLDG(ERM):
     # compute second-order derivatives, implementing the First-Order MAML
     # method (FOMAML) described in the original MAML paper.
 
-    # def update(self, data_envs, unlabeled=None):
+    # def update(self, minibatches, unlabeled=None):
     #     objective = 0
     #     beta = self.hparams["beta"]
     #     inner_iterations = self.hparams["inner_iterations"]
@@ -720,15 +609,15 @@ class MLDG(ERM):
     #     with higher.innerloop_ctx(self.network, self.optimizer,
     #         copy_initial_weights=False) as (inner_network, inner_optimizer):
 
-    #         for (xi, yi), (xj, yj) in random_pairs_of_minibatches(data_envs):
+    #         for (xi, yi), (xj, yj) in random_pairs_of_minibatches(minibatches):
     #             for inner_iteration in range(inner_iterations):
-    #                 li = self.loss_fn(inner_network(xi), yi)
+    #                 li = F.cross_entropy(inner_network(xi), yi)
     #                 inner_optimizer.step(li)
     #
-    #             objective += self.loss_fn(self.network(xi), yi)
-    #             objective += beta * self.loss_fn(inner_network(xj), yj)
+    #             objective += F.cross_entropy(self.network(xi), yi)
+    #             objective += beta * F.cross_entropy(inner_network(xj), yj)
 
-    #         objective /= len(data_envs)
+    #         objective /= len(minibatches)
     #         objective.backward()
     #
     #     self.optimizer.step()
@@ -786,17 +675,17 @@ class AbstractMMD(ERM):
 
             return mean_diff + cova_diff
 
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
         objective = 0
         penalty = 0
-        nmb = len(data_envs)
+        nmb = len(minibatches)
 
-        features = [self.network.featurizer(xi) for xi, _ in data_envs]
+        features = [self.network.featurizer(xi) for xi, _ in minibatches]
         classifs = [self.network.classifier(fi) for fi in features]
-        targets = [yi for _, yi in data_envs]
+        targets = [yi for _, yi in minibatches]
 
         for i in range(nmb):
-            objective += self.loss_fn(classifs[i], targets[i])
+            objective += F.cross_entropy(classifs[i], targets[i])
             for j in range(i + 1, nmb):
                 penalty += self.mmd(features[i], features[j])
 
@@ -820,7 +709,8 @@ class MMD(AbstractMMD):
     """
 
     def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(MMD, self).__init__(input_shape, num_classes, num_domains, hparams, gaussian=True)
+        super(MMD, self).__init__(input_shape, num_classes,
+                                          num_domains, hparams, gaussian=True, **kwargs)
 
 
 class CORAL(AbstractMMD):
@@ -829,7 +719,8 @@ class CORAL(AbstractMMD):
     """
 
     def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(CORAL, self).__init__(input_shape, num_classes, num_domains, hparams, gaussian=False)
+        super(CORAL, self).__init__(input_shape, num_classes,
+                                         num_domains, hparams, gaussian=False, **kwargs)
 
 
 class MTL(Algorithm):
@@ -839,21 +730,31 @@ class MTL(Algorithm):
     (https://arxiv.org/abs/1711.07910)
     """
 
-    def __init__(self, input_shape, num_classes, num_domains, hparams, network=None, **kwargs):
-        super(MTL, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
-        self.network = network or get_network(input_shape, num_classes, hparams, factor=2)
-        self.optimizer = get_optimizer(self.hparams, self.network.parameters())
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(MTL, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs * 2,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+        self.optimizer = torch.optim.Adam(
+            list(self.featurizer.parameters()) +\
+            list(self.classifier.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
 
         self.register_buffer('embeddings',
                              torch.zeros(num_domains,
-                                         self.network.featurizer.n_outputs))
+                                         self.featurizer.n_outputs))
 
         self.ema = self.hparams['mtl_ema']
 
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
         loss = 0
-        for env, (x, y) in enumerate(data_envs):
-            loss += self.loss_fn(self.predict(x, env), y)
+        for env, (x, y) in enumerate(minibatches):
+            loss += F.cross_entropy(self.predict(x, env), y)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -873,9 +774,9 @@ class MTL(Algorithm):
         return return_embedding.view(1, -1).repeat(len(features), 1)
 
     def predict(self, x, env=None):
-        features = self.network.featurizer(x)
+        features = self.featurizer(x)
         embedding = self.update_embeddings_(features, env).normal_()
-        return self.network.classifier(torch.cat((features, embedding), 1))
+        return self.classifier(torch.cat((features, embedding), 1))
 
 class SagNet(Algorithm):
     """
@@ -883,20 +784,21 @@ class SagNet(Algorithm):
     Algorithm 1 from: https://arxiv.org/abs/1910.11645
     """
 
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(SagNet, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(SagNet, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams)
         # featurizer network
         self.network_f = networks.Featurizer(input_shape, self.hparams)
         # content network
         self.network_c = networks.Classifier(
             self.network_f.n_outputs,
             num_classes,
-            self.hparams['classifier_type'])
+            self.hparams['nonlinear_classifier'])
         # style network
         self.network_s = networks.Classifier(
             self.network_f.n_outputs,
             num_classes,
-            self.hparams['classifier_type'])
+            self.hparams['nonlinear_classifier'])
 
         # # This commented block of code implements something closer to the
         # # original paper, but is specific to ResNet and puts in disadvantage
@@ -966,21 +868,21 @@ class SagNet(Algorithm):
         x = x * (var + eps).sqrt() + mean
         return x.view(*sizes)
 
-    def update(self, data_envs, unlabeled=None):
-        all_x = torch.cat([x for x, y in data_envs])
-        all_y = torch.cat([y for x, y in data_envs])
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
 
         # learn content
         self.optimizer_f.zero_grad()
         self.optimizer_c.zero_grad()
-        loss_c = self.loss_fn(self.forward_c(all_x), all_y)
+        loss_c = F.cross_entropy(self.forward_c(all_x), all_y)
         loss_c.backward()
         self.optimizer_f.step()
         self.optimizer_c.step()
 
         # learn style
         self.optimizer_s.zero_grad()
-        loss_s = self.loss_fn(self.forward_s(all_x), all_y)
+        loss_s = F.cross_entropy(self.forward_s(all_x), all_y)
         loss_s.backward()
         self.optimizer_s.step()
 
@@ -999,25 +901,26 @@ class SagNet(Algorithm):
 
 
 class RSC(ERM):
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(RSC, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(RSC, self).__init__(input_shape, num_classes, num_domains,
+                                   hparams)
         self.drop_f = (1 - hparams['rsc_f_drop_factor']) * 100
         self.drop_b = (1 - hparams['rsc_b_drop_factor']) * 100
         self.num_classes = num_classes
 
-    def update(self, data_envs, unlabeled=None):
-        device = "cuda" if data_envs[0][0].is_cuda else "cpu"
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
 
         # inputs
-        all_x = torch.cat([x for x, _ in data_envs])
+        all_x = torch.cat([x for x, y in minibatches])
         # labels
-        all_y = torch.cat([y for _, y in data_envs])
+        all_y = torch.cat([y for _, y in minibatches])
         # one-hot labels
         all_o = torch.nn.functional.one_hot(all_y, self.num_classes)
         # features
-        all_f = self.network.featurizer(all_x)
+        all_f = self.featurizer(all_x)
         # predictions
-        all_p = self.network.classifier(all_f)
+        all_p = self.classifier(all_f)
 
         # Equation (1): compute gradients with respect to representation
         all_g = autograd.grad((all_p * all_o).sum(), all_f)[0]
@@ -1032,7 +935,7 @@ class RSC(ERM):
         all_f_muted = all_f * mask_f
 
         # Equation (4): compute muted predictions
-        all_p_muted = self.network.classifier(all_f_muted)
+        all_p_muted = self.classifier(all_f_muted)
 
         # Section 3.3: Batch Percentage
         all_s = F.softmax(all_p, dim=1)
@@ -1043,10 +946,10 @@ class RSC(ERM):
         mask = torch.logical_or(mask_f, mask_b).float()
 
         # Equations (3) and (4) again, this time mutting over examples
-        all_p_muted_again = self.network.classifier(all_f * mask)
+        all_p_muted_again = self.classifier(all_f * mask)
 
         # Equation (5): update
-        loss = self.loss_fn(all_p_muted_again, all_y)
+        loss = F.cross_entropy(all_p_muted_again, all_y)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -1059,16 +962,17 @@ class SD(ERM):
     Gradient Starvation: A Learning Proclivity in Neural Networks
     Equation 25 from [https://arxiv.org/pdf/2011.09468.pdf]
     """
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(SD, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(SD, self).__init__(input_shape, num_classes, num_domains,
+                                        hparams)
         self.sd_reg = hparams["sd_reg"]
 
-    def update(self, data_envs, unlabeled=None):
-        all_x = torch.cat([x for x,y in data_envs])
-        all_y = torch.cat([y for x,y in data_envs])
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x,y in minibatches])
+        all_y = torch.cat([y for x,y in minibatches])
         all_p = self.predict(all_x)
 
-        loss = self.loss_fn(all_p, all_y)
+        loss = F.cross_entropy(all_p, all_y)
         penalty = (all_p ** 2).mean()
         objective = loss + self.sd_reg * penalty
 
@@ -1084,19 +988,19 @@ class ANDMask(ERM):
     AND-Mask implementation from [https://github.com/gibipara92/learning-explanations-hard-to-vary]
     """
 
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(ANDMask, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(ANDMask, self).__init__(input_shape, num_classes, num_domains, hparams)
 
         self.tau = hparams["tau"]
 
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
         mean_loss = 0
         param_gradients = [[] for _ in self.network.parameters()]
-        for i, (x, y) in enumerate(data_envs):
+        for i, (x, y) in enumerate(minibatches):
             logits = self.network(x)
             
-            env_loss = self.loss_fn(logits, y)
-            mean_loss += env_loss.item() / len(data_envs)
+            env_loss = F.cross_entropy(logits, y)
+            mean_loss += env_loss.item() / len(minibatches)
 
             env_grads = autograd.grad(env_loss, self.network.parameters())
             for grads, env_grad in zip(param_gradients, env_grads):
@@ -1132,13 +1036,13 @@ class IGA(ERM):
     def __init__(self, in_features, num_classes, num_domains, hparams):
         super(IGA, self).__init__(in_features, num_classes, num_domains, hparams)
 
-    def update(self, data_envs, unlabeled=False):
+    def update(self, minibatches, unlabeled=None):
         total_loss = 0
         grads = []
-        for i, (x, y) in enumerate(data_envs):
+        for i, (x, y) in enumerate(minibatches):
             logits = self.network(x)
 
-            env_loss = self.loss_fn(logits, y)
+            env_loss = F.cross_entropy(logits, y)
             total_loss += env_loss
 
             env_grad = autograd.grad(env_loss, self.network.parameters(), 
@@ -1146,7 +1050,7 @@ class IGA(ERM):
 
             grads.append(env_grad)
             
-        mean_loss = total_loss / len(data_envs)
+        mean_loss = total_loss / len(minibatches)
         mean_grad = autograd.grad(mean_loss, self.network.parameters(), 
                                         retain_graph=True)
 
@@ -1166,11 +1070,12 @@ class IGA(ERM):
     
     
 class SelfReg(ERM):
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(SelfReg, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(SelfReg, self).__init__(input_shape, num_classes, num_domains,
+                                   hparams)
         self.num_classes = num_classes
         self.MSEloss = nn.MSELoss()
-        input_feat_size = self.network.featurizer.n_outputs
+        input_feat_size = self.featurizer.n_outputs
         hidden_size = input_feat_size if input_feat_size==2048 else input_feat_size*2
         
         self.cdpl = nn.Sequential(
@@ -1184,10 +1089,10 @@ class SelfReg(ERM):
                             nn.BatchNorm1d(input_feat_size)
         )
         
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
         
-        all_x = torch.cat([x for x, _ in data_envs])
-        all_y = torch.cat([y for _, y in data_envs])
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for _, y in minibatches])
 
         lam = np.random.beta(0.5, 0.5)
         
@@ -1211,10 +1116,10 @@ class SelfReg(ERM):
             all_x = sorted_x
             all_y = sorted_y
         
-        feat = self.network.featurizer(all_x)
+        feat = self.featurizer(all_x)
         proj = self.cdpl(feat)
         
-        output = self.network.classifier(feat)
+        output = self.classifier(feat)
 
         # shuffle
         output_2 = torch.zeros_like(output)
@@ -1242,7 +1147,7 @@ class SelfReg(ERM):
         L_ind_feat = 0.3 * self.MSEloss(feat, feat_2)
         L_hdl_feat = 0.3 * self.MSEloss(feat, feat_3)
         
-        cl_loss = self.loss_fn(output, all_y)
+        cl_loss = F.cross_entropy(output, all_y)
         C_scale = min(cl_loss.item(), 1.)
         loss = cl_loss + C_scale*(lam*(L_ind_logit + L_ind_feat)+(1-lam)*(L_hdl_logit + L_hdl_feat))
      
@@ -1259,29 +1164,30 @@ class SANDMask(ERM):
     <https://arxiv.org/abs/2106.02266>
     """
 
-    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
-        super(SANDMask, self).__init__( input_shape, num_classes, num_domains, hparams, **kwargs)
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(SANDMask, self).__init__(input_shape, num_classes, num_domains, hparams)
 
         self.tau = hparams["tau"]
         self.k = hparams["k"]
-        # betas = (0.9, 0.999)
-        # self.optimizer = torch.optim.Adam(
-        #             self.network.parameters(),
-        #             lr=self.hparams["lr"],
-        #             weight_decay=self.hparams['weight_decay'],
-        #             betas=betas
-        #         )
+        betas = (0.9, 0.999)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay'],
+            betas=betas
+        )
+
         self.register_buffer('update_count', torch.tensor([0]))
 
-    def update(self, data_envs, unlabeled=None):
+    def update(self, minibatches, unlabeled=None):
 
         mean_loss = 0
         param_gradients = [[] for _ in self.network.parameters()]
-        for i, (x, y) in enumerate(data_envs):
+        for i, (x, y) in enumerate(minibatches):
             logits = self.network(x)
 
-            env_loss = self.loss_fn(logits, y)
-            mean_loss += env_loss.item() / len(data_envs)
+            env_loss = F.cross_entropy(logits, y)
+            mean_loss += env_loss.item() / len(minibatches)
             env_grads = autograd.grad(env_loss, self.network.parameters(), retain_graph=True)
             for grads, env_grad in zip(param_gradients, env_grads):
                 grads.append(env_grad)
@@ -1314,4 +1220,699 @@ class SANDMask(ERM):
             mask_t = (mask.sum() / mask.numel())
             param.grad = mask * avg_grad
             param.grad *= (1. / (1e-10 + mask_t))
+
+
+
+class Fishr(Algorithm):
+    "Invariant Gradients variances for Out-of-distribution Generalization"
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        assert backpack is not None, "Install backpack with: 'pip install backpack-for-pytorch==1.3.0'"
+        super(Fishr, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.num_domains = num_domains
+
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = extend(
+            networks.Classifier(
+                self.featurizer.n_outputs,
+                num_classes,
+                self.hparams['nonlinear_classifier'],
+            )
+        )
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+
+        self.register_buffer("update_count", torch.tensor([0]))
+        self.bce_extended = extend(nn.CrossEntropyLoss(reduction='none'))
+        self.ema_per_domain = [
+            MovingAverage(ema=self.hparams["ema"], oneminusema_correction=True)
+            for _ in range(self.num_domains)
+        ]
+        self._init_optimizer()
+
+    def _init_optimizer(self):
+        self.optimizer = torch.optim.Adam(
+            list(self.featurizer.parameters()) + list(self.classifier.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"],
+        )
+
+    def update(self, minibatches, unlabeled=None):
+        assert len(minibatches) == self.num_domains
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        len_minibatches = [x.shape[0] for x, y in minibatches]
+
+        all_z = self.featurizer(all_x)
+        all_logits = self.classifier(all_z)
+
+        penalty = self.compute_fishr_penalty(all_logits, all_y, len_minibatches)
+        all_nll = F.cross_entropy(all_logits, all_y)
+
+        penalty_weight = 0
+        if self.update_count >= self.hparams["penalty_anneal_iters"]:
+            penalty_weight = self.hparams["lambda"]
+            if self.update_count == self.hparams["penalty_anneal_iters"] != 0:
+                # Reset Adam as in IRM or V-REx, because it may not like the sharp jump in
+                # gradient magnitudes that happens at this step.
+                self._init_optimizer()
+        self.update_count += 1
+
+        objective = all_nll + penalty_weight * penalty
+        self.optimizer.zero_grad()
+        objective.backward()
+        self.optimizer.step()
+
+        return {'loss': objective.item(), 'nll': all_nll.item(), 'penalty': penalty.item()}
+
+    def compute_fishr_penalty(self, all_logits, all_y, len_minibatches):
+        dict_grads = self._get_grads(all_logits, all_y)
+        grads_var_per_domain = self._get_grads_var_per_domain(dict_grads, len_minibatches)
+        return self._compute_distance_grads_var(grads_var_per_domain)
+
+    def _get_grads(self, logits, y):
+        self.optimizer.zero_grad()
+        loss = self.bce_extended(logits, y).sum()
+        with backpack(BatchGrad()):
+            loss.backward(
+                inputs=list(self.classifier.parameters()), retain_graph=True, create_graph=True
+            )
+
+        # compute individual grads for all samples across all domains simultaneously
+        dict_grads = OrderedDict(
+            [
+                (name, weights.grad_batch.clone().view(weights.grad_batch.size(0), -1))
+                for name, weights in self.classifier.named_parameters()
+            ]
+        )
+        return dict_grads
+
+    def _get_grads_var_per_domain(self, dict_grads, len_minibatches):
+        # grads var per domain
+        grads_var_per_domain = [{} for _ in range(self.num_domains)]
+        for name, _grads in dict_grads.items():
+            all_idx = 0
+            for domain_id, bsize in enumerate(len_minibatches):
+                env_grads = _grads[all_idx:all_idx + bsize]
+                all_idx += bsize
+                env_mean = env_grads.mean(dim=0, keepdim=True)
+                env_grads_centered = env_grads - env_mean
+                grads_var_per_domain[domain_id][name] = (env_grads_centered).pow(2).mean(dim=0)
+
+        # moving average
+        for domain_id in range(self.num_domains):
+            grads_var_per_domain[domain_id] = self.ema_per_domain[domain_id].update(
+                grads_var_per_domain[domain_id]
+            )
+
+        return grads_var_per_domain
+
+    def _compute_distance_grads_var(self, grads_var_per_domain):
+
+        # compute gradient variances averaged across domains
+        grads_var = OrderedDict(
+            [
+                (
+                    name,
+                    torch.stack(
+                        [
+                            grads_var_per_domain[domain_id][name]
+                            for domain_id in range(self.num_domains)
+                        ],
+                        dim=0
+                    ).mean(dim=0)
+                )
+                for name in grads_var_per_domain[0].keys()
+            ]
+        )
+
+        penalty = 0
+        for domain_id in range(self.num_domains):
+            penalty += l2_between_dicts(grads_var_per_domain[domain_id], grads_var)
+        return penalty / self.num_domains
+
+    def predict(self, x):
+        return self.network(x)
+
+class TRM(Algorithm):
+    """
+    Learning Representations that Support Robust Transfer of Predictors
+    <https://arxiv.org/abs/2110.09940>
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(TRM, self).__init__(input_shape, num_classes, num_domains,hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
+        self.num_domains = num_domains
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = nn.Linear(self.featurizer.n_outputs, num_classes).cuda()
+        self.clist = [nn.Linear(self.featurizer.n_outputs, num_classes).cuda() for i in range(num_domains+1)]
+        self.olist = [torch.optim.SGD(
+            self.clist[i].parameters(),
+            lr=1e-1,
+        ) for i in range(num_domains+1)]
+
+        self.optimizer_f = torch.optim.Adam(
+            self.featurizer.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        self.optimizer_c = torch.optim.Adam(
+            self.classifier.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        # initial weights
+        self.alpha = torch.ones((num_domains, num_domains)).cuda() - torch.eye(num_domains).cuda()
+
+    @staticmethod
+    def neum(v, model, batch):
+        def hvp(y, w, v):
+
+            # First backprop
+            first_grads = autograd.grad(y, w, retain_graph=True, create_graph=True, allow_unused=True)
+            first_grads = torch.nn.utils.parameters_to_vector(first_grads)
+            # Elementwise products
+            elemwise_products = first_grads @ v
+            # Second backprop
+            return_grads = autograd.grad(elemwise_products, w, create_graph=True)
+            return_grads = torch.nn.utils.parameters_to_vector(return_grads)
+            return return_grads
+
+        v = v.detach()
+        h_estimate = v
+        cnt = 0.
+        model.eval()
+        iter = 10
+        for i in range(iter):
+            model.weight.grad *= 0
+            y = model(batch[0].detach())
+            loss = F.cross_entropy(y, batch[1].detach())
+            hv = hvp(loss, model.weight, v)
+            v -= hv
+            v = v.detach()
+            h_estimate = v + h_estimate
+            h_estimate = h_estimate.detach()
+            # not converge
+            if torch.max(abs(h_estimate)) > 10:
+                break
+            cnt += 1
+
+        model.train()
+        return h_estimate.detach()
+
+    def update(self, minibatches, unlabeled=None):
+
+        loss_swap = 0.0
+        trm = 0.0
+
+        if self.update_count >= self.hparams['iters']:
+            # TRM
+            if self.hparams['class_balanced']:
+                # for stability when facing unbalanced labels across environments
+                for classifier in self.clist:
+                    classifier.weight.data = copy.deepcopy(self.classifier.weight.data)
+            self.alpha /= self.alpha.sum(1, keepdim=True)
+            
+            self.featurizer.train()
+            all_x = torch.cat([x for x, y in minibatches])
+            all_y = torch.cat([y for x, y in minibatches])
+            all_feature = self.featurizer(all_x)
+            # updating original network
+            loss = F.cross_entropy(self.classifier(all_feature), all_y)
+
+            for i in range(30):
+                all_logits_idx = 0
+                loss_erm = 0.
+                for j, (x, y) in enumerate(minibatches):
+                    # j-th domain
+                    feature = all_feature[all_logits_idx:all_logits_idx + x.shape[0]]
+                    all_logits_idx += x.shape[0]
+                    loss_erm += F.cross_entropy(self.clist[j](feature.detach()), y)
+                for opt in self.olist:
+                    opt.zero_grad()
+                loss_erm.backward()
+                for opt in self.olist:
+                    opt.step()
+
+            # collect (feature, y)
+            feature_split = list()
+            y_split = list()
+            all_logits_idx = 0
+            for i, (x, y) in enumerate(minibatches):
+                feature = all_feature[all_logits_idx:all_logits_idx + x.shape[0]]
+                all_logits_idx += x.shape[0]
+                feature_split.append(feature)
+                y_split.append(y)
+
+            # estimate transfer risk
+            for Q, (x, y) in enumerate(minibatches):
+                sample_list = list(range(len(minibatches)))
+                sample_list.remove(Q)
+
+                loss_Q = F.cross_entropy(self.clist[Q](feature_split[Q]), y_split[Q])
+                grad_Q = autograd.grad(loss_Q, self.clist[Q].weight, create_graph=True)
+                vec_grad_Q = nn.utils.parameters_to_vector(grad_Q)
+
+                loss_P = [F.cross_entropy(self.clist[Q](feature_split[i]), y_split[i])*(self.alpha[Q, i].data.detach())
+                          if i in sample_list else 0. for i in range(len(minibatches))]
+                loss_P_sum = sum(loss_P)
+                grad_P = autograd.grad(loss_P_sum, self.clist[Q].weight, create_graph=True)
+                vec_grad_P = nn.utils.parameters_to_vector(grad_P).detach()
+                vec_grad_P = self.neum(vec_grad_P, self.clist[Q], (feature_split[Q], y_split[Q]))
+
+                loss_swap += loss_P_sum - self.hparams['cos_lambda'] * (vec_grad_P.detach() @ vec_grad_Q)
+
+                for i in sample_list:
+                    self.alpha[Q, i] *= (self.hparams["groupdro_eta"] * loss_P[i].data).exp()
+
+            loss_swap /= len(minibatches)
+            trm /= len(minibatches)
+        else:
+            # ERM
+            self.featurizer.train()
+            all_x = torch.cat([x for x, y in minibatches])
+            all_y = torch.cat([y for x, y in minibatches])
+            all_feature = self.featurizer(all_x)
+            loss = F.cross_entropy(self.classifier(all_feature), all_y)
+
+        nll = loss.item()
+        self.optimizer_c.zero_grad()
+        self.optimizer_f.zero_grad()
+        if self.update_count >= self.hparams['iters']:
+            loss_swap = (loss + loss_swap)
+        else:
+            loss_swap = loss
+
+        loss_swap.backward()
+        self.optimizer_f.step()
+        self.optimizer_c.step()
+
+        loss_swap = loss_swap.item() - nll
+        self.update_count += 1
+
+        return {'nll': nll, 'trm_loss': loss_swap}
+
+    def predict(self, x):
+        return self.classifier(self.featurizer(x))
+
+    def train(self):
+        self.featurizer.train()
+
+    def eval(self):
+        self.featurizer.eval()
+
+class IB_ERM(ERM):
+    """Information Bottleneck based ERM on feature with conditionning"""
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
+        super(IB_ERM, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams, **kwargs)
+        self.optimizer = torch.optim.Adam(
+            list(self.network.featurizer.parameters()) + list(self.network.classifier.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        self.register_buffer('update_count', torch.tensor([0]))
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        ib_penalty_weight = (self.hparams['ib_lambda'] if self.update_count
+                          >= self.hparams['ib_penalty_anneal_iters'] else
+                          0.0)
+
+        nll = 0.
+        ib_penalty = 0.
+
+        all_x = torch.cat([x for x,y in minibatches])
+        all_features = self.network.featurizer(all_x)
+        all_logits = self.network.classifier(all_features)
+        all_logits_idx = 0
+        for i, (x, y) in enumerate(minibatches):
+            features = all_features[all_logits_idx:all_logits_idx + x.shape[0]]
+            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
+            all_logits_idx += x.shape[0]
+            nll += F.cross_entropy(logits, y)
+            ib_penalty += features.var(dim=0).mean()
+
+        nll /= len(minibatches)
+        ib_penalty /= len(minibatches)
+
+        # Compile loss
+        loss = nll 
+        loss += ib_penalty_weight * ib_penalty
+
+        if self.update_count == self.hparams['ib_penalty_anneal_iters']:
+            # Reset Adam, because it doesn't like the sharp jump in gradient
+            # magnitudes that happens at this step.
+            self.optimizer = torch.optim.Adam(
+                list(self.network.featurizer.parameters()) + list(self.network.classifier.parameters()),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay'])
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.update_count += 1
+        return {'loss': loss.item(), 
+                'nll': nll.item(),
+                'IB_penalty': ib_penalty.item()}
+
+class IB_IRM(ERM):
+    """Information Bottleneck based IRM on feature with conditionning"""
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams, **kwargs):
+        super(IB_IRM, self).__init__(input_shape, num_classes, num_domains,
+                                  hparams, **kwargs)
+        self.optimizer = torch.optim.Adam(
+            list(self.network.featurizer.parameters()) + list(self.network.classifier.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        self.register_buffer('update_count', torch.tensor([0]))
+
+    @staticmethod
+    def _irm_penalty(logits, y):
+        device = logits.device #"cuda" if logits[0][0].is_cuda else "cpu"
+        scale = torch.tensor(1.).to(device).requires_grad_()
+        even_indices = torch.arange(0, logits.shape[0], 2)
+        odd_indices = torch.arange(1, logits.shape[0], 2)
+        loss_1 = F.cross_entropy(logits[even_indices] * scale, y[even_indices])
+        loss_2 = F.cross_entropy(logits[odd_indices] * scale, y[odd_indices])
+        grad_1 = autograd.grad(loss_1, [scale], create_graph=True)[0]
+        grad_2 = autograd.grad(loss_2, [scale], create_graph=True)[0]
+        result = torch.sum(grad_1 * grad_2)
+        return result
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        irm_penalty_weight = (self.hparams['irm_lambda'] if self.update_count
+                          >= self.hparams['irm_penalty_anneal_iters'] else
+                          1.0)
+        ib_penalty_weight = (self.hparams['ib_lambda'] if self.update_count
+                          >= self.hparams['ib_penalty_anneal_iters'] else
+                          0.0)
+
+        nll = 0.
+        irm_penalty = 0.
+        ib_penalty = 0.
+
+        all_x = torch.cat([x for x,y in minibatches])
+        all_features = self.network.featurizer(all_x)
+        all_logits = self.network.classifier(all_features)
+        all_logits_idx = 0
+        for i, (x, y) in enumerate(minibatches):
+            features = all_features[all_logits_idx:all_logits_idx + x.shape[0]]
+            logits = all_logits[all_logits_idx:all_logits_idx + x.shape[0]]
+            all_logits_idx += x.shape[0]
+            nll += F.cross_entropy(logits, y)
+            irm_penalty += self._irm_penalty(logits, y)
+            ib_penalty += features.var(dim=0).mean()
+
+        nll /= len(minibatches)
+        irm_penalty /= len(minibatches)
+        ib_penalty /= len(minibatches)
+
+        # Compile loss
+        loss = nll 
+        loss += irm_penalty_weight * irm_penalty
+        loss += ib_penalty_weight * ib_penalty
+
+        if self.update_count == self.hparams['irm_penalty_anneal_iters'] or self.update_count == self.hparams['ib_penalty_anneal_iters']:
+            # Reset Adam, because it doesn't like the sharp jump in gradient
+            # magnitudes that happens at this step.
+            self.optimizer = torch.optim.Adam(
+                list(self.network.featurizer.parameters()) + list(self.network.classifier.parameters()),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay'])
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.update_count += 1
+        return {'loss': loss.item(), 
+                'nll': nll.item(),
+                'IRM_penalty': irm_penalty.item(), 
+                'IB_penalty': ib_penalty.item()}
+
+
+class AbstractCAD(Algorithm):
+    """Contrastive adversarial domain bottleneck (abstract class)
+    from Optimal Representations for Covariate Shift <https://arxiv.org/abs/2201.00057>
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains,
+                 hparams, is_conditional):
+        super(AbstractCAD, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+        params = list(self.featurizer.parameters()) + list(self.classifier.parameters())
+
+        # parameters for domain bottleneck loss
+        self.is_conditional = is_conditional  # whether to use bottleneck conditioned on the label
+        self.base_temperature = 0.07
+        self.temperature = hparams['temperature']
+        self.is_project = hparams['is_project']  # whether apply projection head
+        self.is_normalized = hparams['is_normalized'] # whether apply normalization to representation when computing loss
+
+        # whether flip maximize log(p) (False) to minimize -log(1-p) (True) for the bottleneck loss
+        # the two versions have the same optima, but we find the latter is more stable
+        self.is_flipped = hparams["is_flipped"]
+
+        if self.is_project:
+            self.project = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(feature_dim, 128),
+            )
+            params += list(self.project.parameters())
+
+        # Optimizers
+        self.optimizer = torch.optim.Adam(
+            params,
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+
+    def bn_loss(self, z, y, dom_labels):
+        """Contrastive based domain bottleneck loss
+         The implementation is based on the supervised contrastive loss (SupCon) introduced by
+         P. Khosla, et al., in “Supervised Contrastive Learning“.
+        Modified from  https://github.com/HobbitLong/SupContrast/blob/8d0963a7dbb1cd28accb067f5144d61f18a77588/losses.py#L11
+        """
+        device = z.device
+        batch_size = z.shape[0]
+
+        y = y.contiguous().view(-1, 1)
+        dom_labels = dom_labels.contiguous().view(-1, 1)
+        mask_y = torch.eq(y, y.T).to(device)
+        mask_d = (torch.eq(dom_labels, dom_labels.T)).to(device)
+        mask_drop = ~torch.eye(batch_size).bool().to(device)  # drop the "current"/"self" example
+        mask_y &= mask_drop
+        mask_y_n_d = mask_y & (~mask_d)  # contain the same label but from different domains
+        mask_y_d = mask_y & mask_d  # contain the same label and the same domain
+        mask_y, mask_drop, mask_y_n_d, mask_y_d = mask_y.float(), mask_drop.float(), mask_y_n_d.float(), mask_y_d.float()
+
+        # compute logits
+        if self.is_project:
+            z = self.project(z)
+        if self.is_normalized:
+            z = F.normalize(z, dim=1)
+        outer = z @ z.T
+        logits = outer / self.temperature
+        logits = logits * mask_drop
+        # for numerical stability
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
+
+        if not self.is_conditional:
+            # unconditional CAD loss
+            denominator = torch.logsumexp(logits + mask_drop.log(), dim=1, keepdim=True)
+            log_prob = logits - denominator
+
+            mask_valid = (mask_y.sum(1) > 0)
+            log_prob = log_prob[mask_valid]
+            mask_d = mask_d[mask_valid]
+
+            if self.is_flipped:  # maximize log prob of samples from different domains
+                bn_loss = - (self.temperature / self.base_temperature) * torch.logsumexp(
+                    log_prob + (~mask_d).float().log(), dim=1)
+            else:  # minimize log prob of samples from same domain
+                bn_loss = (self.temperature / self.base_temperature) * torch.logsumexp(
+                    log_prob + (mask_d).float().log(), dim=1)
+        else:
+            # conditional CAD loss
+            if self.is_flipped:
+                mask_valid = (mask_y_n_d.sum(1) > 0)
+            else:
+                mask_valid = (mask_y_d.sum(1) > 0)
+
+            mask_y = mask_y[mask_valid]
+            mask_y_d = mask_y_d[mask_valid]
+            mask_y_n_d = mask_y_n_d[mask_valid]
+            logits = logits[mask_valid]
+
+            # compute log_prob_y with the same label
+            denominator = torch.logsumexp(logits + mask_y.log(), dim=1, keepdim=True)
+            log_prob_y = logits - denominator
+
+            if self.is_flipped:  # maximize log prob of samples from different domains and with same label
+                bn_loss = - (self.temperature / self.base_temperature) * torch.logsumexp(
+                    log_prob_y + mask_y_n_d.log(), dim=1)
+            else:  # minimize log prob of samples from same domains and with same label
+                bn_loss = (self.temperature / self.base_temperature) * torch.logsumexp(
+                    log_prob_y + mask_y_d.log(), dim=1)
+
+        def finite_mean(x):
+            # only 1D for now
+            num_finite = (torch.isfinite(x).float()).sum()
+            mean = torch.where(torch.isfinite(x), x, torch.tensor(0.0).to(x)).sum()
+            if num_finite != 0:
+                mean = mean / num_finite
+            else:
+                return torch.tensor(0.0).to(x)
+            return mean
+
+        return finite_mean(bn_loss)
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        all_z = self.featurizer(all_x)
+        all_d = torch.cat([
+            torch.full((x.shape[0],), i, dtype=torch.int64, device=device)
+            for i, (x, y) in enumerate(minibatches)
+        ])
+
+        bn_loss = self.bn_loss(all_z, all_y, all_d)
+        clf_out = self.classifier(all_z)
+        clf_loss = F.cross_entropy(clf_out, all_y)
+        total_loss = clf_loss + self.hparams['lmbda'] * bn_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+
+        return {"clf_loss": clf_loss.item(), "bn_loss": bn_loss.item(), "total_loss": total_loss.item()}
+
+    def predict(self, x):
+        return self.classifier(self.featurizer(x))
+
+
+class CAD(AbstractCAD):
+    """Contrastive Adversarial Domain (CAD) bottleneck
+
+       Properties:
+       - Minimize I(D;Z)
+       - Require access to domain labels but not task labels
+       """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CAD, self).__init__(input_shape, num_classes, num_domains, hparams, is_conditional=False)
+
+
+class CondCAD(AbstractCAD):
+    """Conditional Contrastive Adversarial Domain (CAD) bottleneck
+
+    Properties:
+    - Minimize I(D;Z|Y)
+    - Require access to both domain labels and task labels
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CondCAD, self).__init__(input_shape, num_classes, num_domains, hparams, is_conditional=True)
+        
+       
+class Transfer(Algorithm):
+    '''Algorithm 1 in Quantifying and Improving Transferability in Domain Generalization (https://arxiv.org/abs/2106.03632)'''
+    ''' tries to ensure transferability among source domains, and thus transferabiilty between source and target'''
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(Transfer, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.register_buffer('update_count', torch.tensor([0]))
+        self.d_steps_per_g = hparams['d_steps_per_g']
+
+        # Architecture 
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+        self.adv_classifier = networks.Classifier(
+            self.featurizer.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+        self.adv_classifier.load_state_dict(self.classifier.state_dict())
+
+        # Optimizers
+        if self.hparams['gda']:
+            self.optimizer = torch.optim.SGD(self.adv_classifier.parameters(), lr=self.hparams['lr']) 
+        else:
+            self.optimizer = torch.optim.Adam(
+            (list(self.featurizer.parameters()) + list(self.classifier.parameters())),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay'])
+
+        self.adv_opt = torch.optim.SGD(self.adv_classifier.parameters(), lr=self.hparams['lr_d']) 
+
+
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        # outer loop
+        all_x = torch.cat([x for x,y in minibatches])
+        all_y = torch.cat([y for x,y in minibatches])
+        loss = F.cross_entropy(self.predict(all_x), all_y)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        del all_x, all_y
+        gap = self.hparams['t_lambda'] * loss_gap(minibatches, self, device)
+        self.optimizer.zero_grad()
+        gap.backward()
+        self.optimizer.step()
+        self.adv_classifier.load_state_dict(self.classifier.state_dict())
+        for _ in range(self.d_steps_per_g):
+            self.adv_opt.zero_grad()
+            gap = -self.hparams['t_lambda'] * loss_gap(minibatches, self, device)
+            gap.backward()
+            self.adv_opt.step()
+            self.adv_classifier = proj(self.hparams['delta'], self.adv_classifier, self.classifier)
+        return {'loss': loss.item(), 'gap': -gap.item()}
+
+    def update_second(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        self.update_count = (self.update_count + 1) % (1 + self.d_steps_per_g)
+        if self.update_count.item() == 1:
+            all_x = torch.cat([x for x,y in minibatches])
+            all_y = torch.cat([y for x,y in minibatches])
+            loss = F.cross_entropy(self.predict(all_x), all_y)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            del all_x, all_y
+            gap = self.hparams['t_lambda'] * loss_gap(minibatches, self, device)
+            self.optimizer.zero_grad()
+            gap.backward()
+            self.optimizer.step()
+            self.adv_classifier.load_state_dict(self.classifier.state_dict())
+            return {'loss': loss.item(), 'gap': gap.item()}
+        else:
+            self.adv_opt.zero_grad()
+            gap = -self.hparams['t_lambda'] * loss_gap(minibatches, self, device)
+            gap.backward()
+            self.adv_opt.step()
+            self.adv_classifier = proj(self.hparams['delta'], self.adv_classifier, self.classifier)
+            return {'gap': -gap.item()}
+
+
+    def predict(self, x):
+        return self.classifier(self.featurizer(x))
+
 

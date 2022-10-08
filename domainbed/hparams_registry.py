@@ -14,7 +14,7 @@ def get_hparams(algorithm, dataset, random_seed):
     New algorithms / networks / etc. should add entries here.
     """
 
-    SMALL_IMAGES = ['Debug28', 'RotatedMNIST', 'ColoredMNIST', 'CSMultiColoredMNIST'] #, 'ShapeTexture']
+    SMALL_IMAGES = ['Debug28', 'RotatedMNIST', 'ColoredMNIST']
 
     hparams = {}
 
@@ -30,13 +30,15 @@ def get_hparams(algorithm, dataset, random_seed):
     # Unconditional hparam definitions.
     
     _hparam('data_augmentation', True, lambda r: True)
-    # _hparam('resnet18', False, lambda r: False)
-    # _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
+    _hparam('resnet18', False, lambda r: False)
+    _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
     _hparam('class_balanced', False, lambda r: False)
     # TODO: nonlinear classifiers disabled
     # _hparam('nonlinear_classifier', False, lambda r: bool(r.choice([False, False])))
-    _hparam('classifier_type', 'linear', lambda r: 'linear') # r.choice(['linear', 'nonlinear', 'identity'])) #bool(r.choice([False, False])))
+    _hparam('classifier_type', 'linear', lambda r: 'linear')
     _hparam('featurizer_type',  None, lambda r: None) 
+    _hparam('grad_clip', 100, lambda r: 100)
+    _hparam('momentum', 0.9, lambda r: 0.9)
 
     # Algorithm-specific hparam definitions. Each block of code below
     # corresponds to exactly one algorithm.
@@ -62,28 +64,35 @@ def get_hparams(algorithm, dataset, random_seed):
         _hparam('sag_w_adv', 0.1, lambda r: 10 ** r.uniform(-2, 1))
 
     elif algorithm.endswith("ADMM"):
-        _hparam('ADMM_mu', 5, lambda r: 5)
-        _hparam('ADMM_accum_rate', 25, lambda r: 25)
+        _hparam('ADMM_mu', 1, lambda r: 1)
+        _hparam('ADMM_accum_rate', 10, lambda r: 10)
         _hparam('lr_scale_grad', 0.0, lambda r: 0.0)
 
-    elif algorithm.startswith("IRM") or algorithm.startswith("ICM") or algorithm.startswith("rev_IRM"):
+    elif algorithm.startswith("IRM") or algorithm.startswith("MRI"):
         _hparam('irm_lambda', 1e4, lambda r: 10 ** r.uniform(-1, 5))
         _hparam('irm_penalty_anneal_iters', 0, lambda r: int(10 ** r.uniform(0, 4)))
-        _hparam('irm_type', None, lambda r: None)
     
-    # elif algorithm.startswith("ICM"):
-    #     _hparam('irm_lambda', 1e4, lambda r: 10 ** r.uniform(4, 6))
-    #     _hparam('irm_penalty_anneal_iters', 0, lambda r: 0)
-    #     _hparam('irm_type', None, lambda r: None)
+    elif algorithm == "IB_ERM":
+        _hparam('ib_lambda', 1e2, lambda r: 10**r.uniform(-1, 5))
+        _hparam('ib_penalty_anneal_iters', 500,
+                lambda r: int(10**r.uniform(0, 4)))
+
+    elif algorithm == "IB_IRM":
+        _hparam('irm_lambda', 1e2, lambda r: 10**r.uniform(-1, 5))
+        _hparam('irm_penalty_anneal_iters', 500,
+                lambda r: int(10**r.uniform(0, 4)))
+        _hparam('ib_lambda', 1e2, lambda r: 10**r.uniform(-1, 5))
+        _hparam('ib_penalty_anneal_iters', 500,
+                lambda r: int(10**r.uniform(0, 4)))
         
     elif algorithm == "Mixup":
         _hparam('mixup_alpha', 0.2, lambda r: 10 ** r.uniform(-1, -1))
 
     elif algorithm == "GroupDRO":
-        _hparam('groupdro_eta', 1e-2, lambda r: 10 ** r.uniform(-3, -1))
+        _hparam('groupdro_eta', 1e-2, lambda r: 10**r.uniform(-3, -1))
 
-    elif algorithm == "MMD" or algorithm == "CORAL":
-        _hparam('mmd_gamma', 1., lambda r: 10 ** r.uniform(-1, 1))
+    elif algorithm == "MMD" or algorithm == "CORAL" or algorithm == "CausIRL_CORAL" or algorithm == "CausIRL_MMD":
+        _hparam('mmd_gamma', 1., lambda r: 10**r.uniform(-1, 1))
 
     elif algorithm == "MLDG":
         _hparam('mldg_beta', 1., lambda r: 10 ** r.uniform(-1, 1))
@@ -140,20 +149,6 @@ def get_hparams(algorithm, dataset, random_seed):
         _hparam('lr_d', 5e-5, lambda r: 10 ** r.uniform(-5, -3.5))
         _hparam('weight_decay_g', 0., lambda r: 10 ** r.uniform(-6, -2))
 
-    # if dataset in ['Debug28', 'RotatedMNIST', 'ColoredMNIST', 'FactoredCMNIST', 'CSMultiColoredMNIST']:
-    #     _hparam('env_param_list', None, lambda r: None)
-
-    # if dataset == "FactoredCMNIST" or dataset.startswith("ShapeTexture"):
-    # _hparam('mlp_width', 28, lambda r: int(2 ** r.uniform(6, 10)))
-    # _hparam('mlp_depth', 2, lambda r: int(r.choice([3, 4, 5])))
-    # _hparam('mlp_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
-
-        
-    _hparam('loss_type', 'classification', lambda r: 'classification')
-    _hparam('optim', 'SGD', lambda r: 'SGD')
-    _hparam('momentum', 0.9, lambda r: 0.9)
-    _hparam('grad_clip', 10, lambda r: 10)
-    # _hparam('init_scale', 1, lambda r: 1)
     return hparams
 
 

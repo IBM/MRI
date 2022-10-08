@@ -83,10 +83,27 @@ def get_hparams(args):
         else:
             raise ValueError()
             
-    hparams_.update({key: getattr(args, key) for key in ['feature_type', 'loss_type', 'optim', 'grad_clip', 'momentum']})
+    # hparams_.update({key: getattr(args, key) for key in ['feature_type', 'loss_type', 'optim', 'grad_clip', 'momentum']})
+    hparams_.update({key: getattr(args, key) for key in ['loss_type', 'optim',]})
+    
+    if args.dataset.startswith('ShapeTexture') or args.dataset.endswith('MNIST'):
+        hparams_.update({key: getattr(args, key) for key in ['env_param_list', 
+                                                             'causal_param', 
+                                                             'total_batch']})
+        
+    if args.dataset.startswith('ShapeTexture'):
+        hparams_.update({key: getattr(args, key) for key in ['max_phase',
+                                                             'label_type',
+                                                             'feature_type',
+                                                             'n_bin']})
+        
     hparams.update(hparams_)
     
-    hparams_dict = {key: val for key,val in hparams_.items() if key not in ['grad_clip', 'momentum'] and not isinstance(val,str)}
+    hparams_dict = {key: val for key,val in hparams_.items() if key not in ['grad_clip', 'momentum',
+                                                                            'max_phase',
+                                                                            'label_type',
+                                                                            'n_bin',
+                                                                           ] and not isinstance(val,str)}
     hparams_dict = {key: hparams_[key] for key in sorted(hparams_dict.keys(), key=lambda x:x.lower())}
     hparams_str = [val for key,val in hparams_.items() if isinstance(val,str)]
     args.hparams = str(hparams_str) + ',' + str(hparams_dict)
