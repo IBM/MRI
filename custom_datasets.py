@@ -67,56 +67,12 @@ class ShapeTexture(MultipleDomainDataset):
     def generate_spurious_envs(self, env_params, keyword, default_params):
         return [{**default_params, keyword: param} for param in env_params]
     
-import numpy as np
+    
 class ShapeTexture_corr(ShapeTexture):
     ENV_variation_type = 'corr'
     env_param_list = [0, 1.0, 0.8]
     causal_param = {"offset": 0, "std": 0, "corr": 0.75}
     spurious_param_default = {"offset": 0, "std": 0, "corr": None}
-    
-# class ShapeTexture_corr0(ShapeTexture_corr):
-#     env_param_list = [0, 0, 0]
-#     spurious_param_default = {"offset": 0, "std": 2, "corr": None}
-
-# class ShapeTexture_offset(ShapeTexture):
-#     ENV_variation_type = 'offset'
-#     env_param_list = [np.pi / 2, -0.4, 0.4]
-#     causal_param = {"offset": 0, "std": 0, "corr": 0.8}
-#     spurious_param_default = {"offset": None, "std": 0, "corr": 0.9}
-
-# class ShapeTexture_offset2(ShapeTexture):
-#     ENV_variation_type = 'offset'
-#     env_param_list = [np.pi / 2, -0.2, 0.2]
-#     causal_param = {"offset": 0, "std": 0.8, "corr": 1}
-#     spurious_param_default = {"offset": None, "std": 0.2, "corr": 1}
-    
-# class ShapeTexture_offset3(ShapeTexture):
-#     ENV_variation_type = 'offset'
-#     env_param_list = [np.pi / 2, -0.4, 0.4]
-#     causal_param = {"offset": 0, "std": 0.4, "corr": 1}
-#     spurious_param_default = {"offset": None, "std": 0.0, "corr": 1}
-
-# class ShapeTexture_offset4(ShapeTexture):
-#     ENV_variation_type = 'offset'
-#     env_param_list = [np.pi / 2, 0.0, 0.6]
-#     causal_param = {"offset": 0, "std": 0.4, "corr": 1}
-#     spurious_param_default = {"offset": None, "std": 0.0, "corr": 1}
-        
-# class ShapeTexture_offset5(ShapeTexture):
-#     ENV_variation_type = 'offset'
-#     env_param_list = [np.pi / 2, 0.0, 0.4]
-#     causal_param = {"offset": 0, "std": 0, "corr": 0.75}
-#     spurious_param_default = {"offset": None, "std": 0, "corr": 1}
-    
-# class ShapeTexture_std(ShapeTexture):
-#     ENV_variation_type = 'std'
-#     env_param_list = [3.0, 0, 0.6]
-#     causal_param = {"offset": 0, "std": 0.7, "corr": 1}
-#     spurious_param_default = {"offset": 0, "std": None, "corr": 1}
-    
-# class ShapeTexture_std2(ShapeTexture_std):
-#     causal_param = {"offset": 0, "std": 0.7, "corr": 0.9}
-#     spurious_param_default = {"offset": 0, "std": None, "corr": 0.9}
     
 
 class CustomMultipleEnvironmentMNIST(MultipleDomainDataset):
@@ -196,7 +152,6 @@ class CustomColoredMNIST(CustomMultipleEnvironmentMNIST):
         else:
             num_classes_ = 2
             
-        print(self.causal_param, env_param_list,  augment, total_batch)
         super().__init__(root, env_param_list, test_envs, augment, 
                          self.color_dataset, (2, 28, 28,), num_classes_, total_batch)
 
