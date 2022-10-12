@@ -1,10 +1,10 @@
 # MRI
 This repository contains source code for the paper [The Missing Invariance Principle found –
-the Reciprocal Twin of Invariant Risk Minimization](https://arxiv.org/abs/2205.14546).
+the Reciprocal Twin of Invariant Risk Minimization](https://arxiv.org/abs/2205.14546). This repository is based on the [Domainbed](https://github.com/facebookresearch/DomainBed) suite.
 
 ## Training
 
-Refer [here](https://github.com/benhuh/MRI/blob/main/domainbed/scripts/train.py) for details on how to train a model. An example training procedure to train on the ColoredMNIST dataset is implemented in the python script below: 
+Refer [here](https://github.com/benhuh/MRI/blob/main/domainbed/scripts/train.py) for details on how to train a model. An example training procedure for the ColoredMNIST dataset is implemented in the python script below: 
 
 ```sh
 from domainbed.scripts.train import main
