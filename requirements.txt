@@ -20,4 +20,4 @@ numpy==1.21.2
 pytorch-lightning==1.5.10
 ipykernel==5.5.5
 ipywidgets==7.6.5
-jupyterlab==3.2.4
+jupyterlab==4.5.11
